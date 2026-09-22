@@ -57,9 +57,14 @@ a blocker on building it.
    signing order, index 0 first. Returns the request plus a `Map` of raw tokens
    (available only here; only the hash is persisted).
 2. Build a signing URL per signer (`/sign/<requestId>/<signerId>?token=<rawToken>`,
-   whatever routing the consuming app uses) and send it — first signer immediately,
-   later signers only once `nextSignerToInvite` says it's their turn. `inviteEmail` /
-   `BrevoEmailSender` in `src/email.ts` are ready-made for this.
+   whatever routing the consuming app uses) and send the first signer's invite
+   immediately with their creation-time token. For a second/third signer, don't hold
+   onto their creation-time token waiting for their turn — call
+   `issueSignerToken(store, requestId, signerId)` right before sending their invite
+   (i.e. once `captureSignature` says it's their turn via `nextSigner`) to mint a
+   fresh one. Only the hash is ever persisted, so the original token is gone by the
+   time an earlier signer finishes. `inviteEmail` / `BrevoEmailSender` in
+   `src/email.ts` are ready-made for actually sending it.
 3. **GET the signing page → `getSigningView`.** This only renders the document and
    logs a `viewed` audit event. It must never sign anything — see the comment in
    `src/sign.ts` on why: corporate mail-scanner sandboxes (Microsoft Safe Links,

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createSignatureRequest } from "../src/request.ts";
+import { createSignatureRequest, issueSignerToken } from "../src/request.ts";
 import { getSigningView, captureSignature, SigningError } from "../src/sign.ts";
 import { renderSignedRecord } from "../src/render.ts";
 import type { AuditEvent, RequestStatus, SignatureRequest, SignatureStore, Signer } from "../src/types.ts";
@@ -129,6 +129,27 @@ test("full two-signer flow completes and renders a record with both signatures",
   assert.match(record, /Guest Person/);
   assert.match(record, /Host Person/);
   assert.match(record, new RegExp(request.documentSha256));
+});
+
+test("a freshly issued token lets a countersigner be invited after the fact", async () => {
+  const { store, request, rawTokens } = await makeTwoSignerRequest();
+  const [guest, host] = request.signers;
+
+  await captureSignature(store, {
+    requestId: request.id,
+    signerId: guest.id,
+    token: rawTokens.get(guest.id)!,
+    typedLegalName: "Guest Person",
+    agreedToElectronicSignature: true,
+    documentSha256Seen: request.documentSha256,
+  });
+
+  // The host's creation-time token is intentionally never used — this mints a fresh
+  // one, the way the completion handler does right before sending the invite.
+  const rotatedToken = await issueSignerToken(store, request.id, host.id);
+
+  const view = await getSigningView(store, { requestId: request.id, signerId: host.id, token: rotatedToken });
+  assert.equal(view.signer.id, host.id);
 });
 
 test("signing without agreeing to the electronic-records disclosure is rejected", async () => {

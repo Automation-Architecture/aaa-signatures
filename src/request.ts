@@ -73,3 +73,23 @@ export function nextSignerToInvite(request: SignatureRequest): Signer | undefine
   }
   return undefined;
 }
+
+/**
+ * Mint a fresh token for a signer and return the raw value to embed in their invite
+ * link. Needed for a second/third signer in a sequence: `createSignatureRequest`
+ * only ever returns raw tokens once, at creation, and by the time an earlier signer
+ * has finished — which is when a countersigner should actually be emailed — that
+ * value is gone (only its hash was ever persisted). Call this right before sending
+ * that signer's invite rather than trying to hold onto a token from creation time.
+ */
+export async function issueSignerToken(
+  store: SignatureStore,
+  requestId: string,
+  signerId: string,
+  expiresInDays = 14,
+): Promise<string> {
+  const token = generateToken();
+  const tokenExpiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
+  await store.updateSigner(requestId, signerId, { tokenHash: hashToken(token), tokenExpiresAt });
+  return token;
+}
