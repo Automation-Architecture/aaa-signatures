@@ -24,7 +24,7 @@ export const config = {
   brevoApiKey: process.env.BREVO_API_KEY ?? "",
   emailFrom: {
     name: process.env.EMAIL_FROM_NAME ?? "Automation Architecture AI",
-    email: process.env.EMAIL_FROM_EMAIL ?? "contracts@automationarchitecture.ai",
+    email: process.env.EMAIL_FROM_EMAIL ?? "contract@automationarchitecture.ai",
   },
   maxUploadBytes: 25 * 1024 * 1024,
   linkExpiresInDays: 14,
