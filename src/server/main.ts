@@ -25,7 +25,7 @@ interface Attachment { name: string; content: Buffer }
 
 async function sendEmail(input: { to: { email: string; name: string }; subject: string; html: string; text: string; attachments?: Attachment[] }) {
   if (!config.brevoApiKey) {
-    console.warn(`[email] BREVO_API_KEY not set; would have sent "${input.subject}" to ${input.to.email}`);
+    console.warn(`[email] BREVO_API_KEY not set; would have sent "${input.subject}" to ${input.to.email}\n${input.text}`);
     return;
   }
   const response = await fetch("https://api.brevo.com/v3/smtp/email", {
