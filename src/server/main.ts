@@ -82,23 +82,70 @@ async function ensureSignedPdf(requestId: string) {
   return { request, doc, signedPdf, signedSha256 };
 }
 
-/** Email the executed PDF to every signer. Returns the addresses that failed. */
-async function sendCompletionEmails(requestId: string): Promise<string[]> {
-  const { request, doc, signedPdf, signedSha256 } = await ensureSignedPdf(requestId);
-  const filename = doc.filename.replace(/\.pdf$/i, "") + " (signed).pdf";
-  const failed: string[] = [];
-  for (const signer of request.signers) {
-    const subject = `Signed and complete: ${request.title}`;
-    const text = `Hi ${signer.name},\n\nEveryone has signed "${request.title}". The fully executed PDF, including the signature certificate, is attached for your records.\n\nExecuted PDF SHA-256: ${signedSha256}\n\nAutomation Architecture AI`;
-    const body = `<p>Hi ${pages.esc(signer.name)},</p><p>Everyone has signed <strong>${pages.esc(request.title)}</strong>. The fully executed PDF, including the signature certificate, is attached for your records.</p><p style="font-size:.85em;color:#636363">Executed PDF SHA-256: ${signedSha256}</p><p>Automation Architecture AI</p>`;
+const finalizing = new Set<string>();
+
+/**
+ * Deliver the executed PDF to every signer who hasn't received it yet (or to every
+ * signer when `force` is set, for the admin's "Resend" button). Delivery state is
+ * persisted per signer, so a failure is retried by the background worker instead of
+ * being lost in a log line. Returns the addresses that failed this time.
+ */
+async function sendCompletionEmails(requestId: string, opts: { force?: boolean } = {}): Promise<string[]> {
+  if (finalizing.has(requestId)) return [];
+  finalizing.add(requestId);
+  try {
+    const request = await store.getRequest(requestId);
+    if (!request) throw new Error("no such request");
+    await store.ensureDeliveries(requestId, request.signers.map((s) => s.id));
+    const pending = new Set(
+      (await store.listDeliveries(requestId)).filter((d) => opts.force || !d.deliveredAt).map((d) => d.signerId),
+    );
+    if (pending.size === 0) return [];
+
+    let built: Awaited<ReturnType<typeof ensureSignedPdf>>;
     try {
-      await sendEmail({ to: { email: signer.email, name: signer.name }, subject, html: body, text, attachments: [{ name: filename, content: signedPdf }] });
+      built = await ensureSignedPdf(requestId);
     } catch (error) {
-      console.error(`[email] completion email to ${signer.email} failed`, error);
-      failed.push(signer.email);
+      const message = `could not build executed PDF: ${error instanceof Error ? error.message : String(error)}`;
+      for (const signerId of pending) await store.recordDelivery(requestId, signerId, message);
+      throw error;
     }
+    const { doc, signedPdf, signedSha256 } = built;
+    const filename = doc.filename.replace(/\.pdf$/i, "") + " (signed).pdf";
+    const failed: string[] = [];
+    for (const signer of request.signers.filter((s) => pending.has(s.id))) {
+      const subject = `Signed and complete: ${request.title}`;
+      const text = `Hi ${signer.name},\n\nEveryone has signed "${request.title}". The fully executed PDF, including the signature certificate, is attached for your records.\n\nExecuted PDF SHA-256: ${signedSha256}\n\nAutomation Architecture AI`;
+      const body = `<p>Hi ${pages.esc(signer.name)},</p><p>Everyone has signed <strong>${pages.esc(request.title)}</strong>. The fully executed PDF, including the signature certificate, is attached for your records.</p><p style="font-size:.85em;color:#636363">Executed PDF SHA-256: ${signedSha256}</p><p>Automation Architecture AI</p>`;
+      try {
+        await sendEmail({ to: { email: signer.email, name: signer.name }, subject, html: body, text, attachments: [{ name: filename, content: signedPdf }] });
+        await store.recordDelivery(requestId, signer.id);
+      } catch (error) {
+        console.error(`[email] completion email to ${signer.email} failed`, error);
+        await store.recordDelivery(requestId, signer.id, error instanceof Error ? error.message : String(error));
+        failed.push(signer.email);
+      }
+    }
+    return failed;
+  } finally {
+    finalizing.delete(requestId);
   }
-  return failed;
+}
+
+/** Background retry for completion deliveries that failed. */
+async function retryDueDeliveries() {
+  try {
+    for (const requestId of await store.listDueDeliveries()) {
+      try {
+        const failed = await sendCompletionEmails(requestId);
+        console.log(`[retry] request ${requestId}: ${failed.length ? `still failing for ${failed.join(", ")}` : "delivered"}`);
+      } catch (error) {
+        console.error(`[retry] request ${requestId} finalization failed`, error);
+      }
+    }
+  } catch (error) {
+    console.error("[retry] could not list due deliveries", error);
+  }
 }
 
 // ---- routing -----------------------------------------------------------------------
@@ -217,8 +264,9 @@ route("GET", new RegExp(`^/requests/${UUID}$`), async (req, res, [id], url) => {
   const doc = await store.getDocument(id!);
   if (!request || !doc) throw new HttpError(404, "no such request");
   const events = await store.listAuditEvents(id!);
+  const deliveries = await store.listDeliveries(id!);
   html(res, 200, pages.requestDetailPage({
-    request, events, filename: doc.filename, pdfSha256: doc.pdfSha256, hasSigned: Boolean(doc.signedPdf),
+    request, events, deliveries, filename: doc.filename, pdfSha256: doc.pdfSha256, hasSigned: Boolean(doc.signedPdf),
     notice: url.searchParams.get("notice") ?? undefined, error: url.searchParams.get("error") ?? undefined,
   }));
 });
@@ -258,7 +306,7 @@ route("POST", new RegExp(`^/requests/${UUID}/finalize$`), async (req, res, [id])
     return;
   }
   try {
-    const failed = await sendCompletionEmails(id!);
+    const failed = await sendCompletionEmails(id!, { force: true });
     const query = failed.length ? `error=${encodeURIComponent(`Executed PDF ready, but email failed for ${failed.join(", ")}.`)}` : `notice=${encodeURIComponent("Executed PDF sent to both parties.")}`;
     redirect(res, `/requests/${id}?${query}`);
   } catch (error) {
@@ -374,5 +422,6 @@ const server = createServer(async (req, res) => {
 if (!transport && !config.emailDevLog) console.error("[email] SMTP_USER/SMTP_PASSWORD not set: every send will fail until they are");
 
 store.migrate().then(() => {
+  setInterval(retryDueDeliveries, Number(process.env.DELIVERY_RETRY_INTERVAL_MS ?? 60_000)).unref();
   server.listen(config.port, () => console.log(`contract app listening on :${config.port} (${config.baseUrl})`));
 }).catch((error) => { console.error("failed to start", error); process.exit(1); });

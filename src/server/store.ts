@@ -1,6 +1,7 @@
 // Postgres-backed SignatureStore plus the contract-app specific tables (the uploaded
 // PDF and the final executed PDF). Schema is applied idempotently at boot.
 import pg from "pg";
+import { SigningError } from "../sign.ts";
 import type { AuditEvent, RequestStatus, SignatureRequest, SignatureStore, Signer } from "../types.ts";
 
 export const SCHEMA_SQL = `
@@ -44,6 +45,36 @@ create table if not exists contract_documents (
   signed_sha256 text,
   completed_at timestamptz
 );
+create table if not exists contract_deliveries (
+  request_id      uuid not null references signature_requests(id) on delete cascade,
+  signer_id       uuid not null references signature_signers(id) on delete cascade,
+  delivered_at    timestamptz,
+  attempts        int not null default 0,
+  last_attempt_at timestamptz,
+  last_error      text,
+  primary key (request_id, signer_id)
+);
+
+-- The audit trail is evidence only if it can't be changed after the fact. The app's
+-- role owns these tables, so REVOKE alone would not bind it; a trigger refuses every
+-- UPDATE, DELETE and TRUNCATE regardless of role. That includes cascades, so a
+-- request with audit history can't be deleted either. Removing this protection takes
+-- deliberate DDL (drop trigger), which a normal cleanup query can't do by accident.
+create or replace function signature_audit_events_append_only() returns trigger
+language plpgsql as $$
+begin
+  raise exception 'signature_audit_events is append-only: % is not allowed', tg_op;
+end;
+$$;
+drop trigger if exists signature_audit_events_no_update_delete on signature_audit_events;
+create trigger signature_audit_events_no_update_delete
+  before update or delete on signature_audit_events
+  for each row execute function signature_audit_events_append_only();
+drop trigger if exists signature_audit_events_no_truncate on signature_audit_events;
+create trigger signature_audit_events_no_truncate
+  before truncate on signature_audit_events
+  for each statement execute function signature_audit_events_append_only();
+
 create index if not exists signature_signers_request_id_idx on signature_signers(request_id);
 create index if not exists signature_audit_events_request_id_idx on signature_audit_events(request_id);
 `;
@@ -56,6 +87,16 @@ export interface ContractDocument {
   signedPdf?: Buffer;
   signedSha256?: string;
   completedAt?: string;
+}
+
+export const MAX_DELIVERY_ATTEMPTS = 10;
+
+export interface Delivery {
+  signerId: string;
+  deliveredAt?: string;
+  attempts: number;
+  lastAttemptAt?: string;
+  lastError?: string;
 }
 
 export interface RequestSummary {
@@ -148,7 +189,11 @@ export class PgStore implements SignatureStore {
     if (patch.tokenExpiresAt) add("token_expires_at", patch.tokenExpiresAt);
     if (sets.length === 0) return;
     values.push(signerId);
-    await this.pool.query(`update signature_signers set ${sets.join(", ")} where id = $${values.length}`, values);
+    // Signing is a conditional transition: only a still-pending signer can become
+    // signed, so a concurrent duplicate submission changes no row and is refused.
+    const guard = patch.status === "signed" ? ` and status = 'pending'` : "";
+    const result = await this.pool.query(`update signature_signers set ${sets.join(", ")} where id = $${values.length}${guard}`, values);
+    if (patch.status === "signed" && result.rowCount === 0) throw new SigningError("already_signed", "already signed");
   }
 
   async updateRequestStatus(requestId: string, status: RequestStatus): Promise<void> {
@@ -216,6 +261,53 @@ export class PgStore implements SignatureStore {
       signedSha256: r.signed_sha256 ?? undefined,
       completedAt: r.completed_at ? new Date(r.completed_at).toISOString() : undefined,
     };
+  }
+
+  /** Create a pending delivery row per signer; existing rows are left alone. */
+  async ensureDeliveries(requestId: string, signerIds: string[]): Promise<void> {
+    for (const signerId of signerIds) {
+      await this.pool.query(
+        "insert into contract_deliveries (request_id, signer_id) values ($1, $2) on conflict do nothing",
+        [requestId, signerId],
+      );
+    }
+  }
+
+  async listDeliveries(requestId: string): Promise<Delivery[]> {
+    const { rows } = await this.pool.query("select * from contract_deliveries where request_id = $1", [requestId]);
+    return rows.map((r) => ({
+      signerId: r.signer_id,
+      deliveredAt: r.delivered_at ? new Date(r.delivered_at).toISOString() : undefined,
+      attempts: r.attempts,
+      lastAttemptAt: r.last_attempt_at ? new Date(r.last_attempt_at).toISOString() : undefined,
+      lastError: r.last_error ?? undefined,
+    }));
+  }
+
+  async recordDelivery(requestId: string, signerId: string, error?: string): Promise<void> {
+    await this.pool.query(
+      `update contract_deliveries
+          set attempts = attempts + 1, last_attempt_at = now(),
+              delivered_at = case when $3::text is null then now() else delivered_at end,
+              last_error = $3
+        where request_id = $1 and signer_id = $2`,
+      [requestId, signerId, error ?? null],
+    );
+  }
+
+  /** Completed requests with an undelivered copy that is due for another attempt.
+   * Backoff doubles from 2 minutes per attempt, capped at 6 hours, for up to
+   * MAX_DELIVERY_ATTEMPTS attempts; after that only the admin button retries. */
+  async listDueDeliveries(): Promise<string[]> {
+    const { rows } = await this.pool.query(
+      `select distinct d.request_id from contract_deliveries d
+         join signature_requests r on r.id = d.request_id
+        where r.status = 'completed' and d.delivered_at is null and d.attempts < $1
+          and (d.last_attempt_at is null
+               or d.last_attempt_at < now() - least(interval '6 hours', interval '2 minutes' * power(2, d.attempts)))`,
+      [MAX_DELIVERY_ATTEMPTS],
+    );
+    return rows.map((r) => r.request_id);
   }
 
   async saveSignedPdf(requestId: string, signedPdf: Buffer, signedSha256: string, completedAt: string): Promise<void> {

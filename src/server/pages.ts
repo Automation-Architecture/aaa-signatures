@@ -1,6 +1,6 @@
 // Server-rendered pages. Brand: Automation-Architecture/aaa-brand DESIGN.md (Jura, teal, lime accent).
 import type { AuditEvent, SignatureRequest, Signer } from "../types.ts";
-import type { RequestSummary } from "./store.ts";
+import { MAX_DELIVERY_ATTEMPTS, type Delivery, type RequestSummary } from "./store.ts";
 
 export function esc(value: unknown): string {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -101,6 +101,7 @@ export function adminPage(input: { requests: RequestSummary[]; adminSigner: { na
 export function requestDetailPage(input: {
   request: SignatureRequest;
   events: AuditEvent[];
+  deliveries: Delivery[];
   filename: string;
   pdfSha256: string;
   hasSigned: boolean;
@@ -109,11 +110,19 @@ export function requestDetailPage(input: {
 }): string {
   const { request } = input;
   const byId = new Map(request.signers.map((s) => [s.id, s]));
+  const deliveryBySigner = new Map(input.deliveries.map((d) => [d.signerId, d]));
+  const deliveryCell = (signerId: string) => {
+    const d = deliveryBySigner.get(signerId);
+    if (!d) return request.status === "completed" ? `<span class="muted">not recorded</span>` : "";
+    if (d.deliveredAt) return `<span class="pill signed">sent</span><br><span class="muted">${esc(d.deliveredAt)}</span>`;
+    const retrying = d.attempts < MAX_DELIVERY_ATTEMPTS;
+    return `<span class="pill voided">${retrying ? "retrying" : "failed"}</span><br><span class="muted">${d.attempts} attempt${d.attempts === 1 ? "" : "s"}${d.lastError ? `: ${esc(d.lastError.slice(0, 160))}` : ""}</span>`;
+  };
   const signerRows = [...request.signers]
     .sort((a, b) => a.order - b.order)
     .map(
       (s) => `<tr><td>${s.order + 1}</td><td>${esc(s.name)}<br><span class="muted">${esc(s.email)}</span></td>
-<td><span class="pill ${esc(s.status)}">${esc(s.status)}</span></td><td>${esc(s.signedAt ?? "")}</td>
+<td><span class="pill ${esc(s.status)}">${esc(s.status)}</span></td><td>${esc(s.signedAt ?? "")}</td><td>${deliveryCell(s.id)}</td>
 <td>${s.status === "pending" && request.status === "pending" ? `<form method="post" action="/requests/${esc(request.id)}/resend" style="margin:0"><input type="hidden" name="signerId" value="${esc(s.id)}"><button class="btn btn-ghost">Resend link</button></form>` : ""}</td></tr>`,
     )
     .join("");
@@ -137,7 +146,7 @@ ${request.status === "completed" ? ` <form method="post" action="/requests/${esc
 ${request.status === "completed" && !input.hasSigned ? `<p class="error" style="margin-top:16px">Both parties signed, but the executed PDF hasn't been generated or sent yet. Use Finalize and send.</p>` : ""}
 ${request.status === "pending" ? ` <form method="post" action="/requests/${esc(request.id)}/void" style="display:inline" onsubmit="return confirm('Void this request? Links stop working immediately.')"><button class="btn btn-ghost">Void request</button></form>` : ""}
 <p class="muted" style="margin-top:16px">Original SHA-256: <code>${esc(input.pdfSha256)}</code><br>Record fingerprint: <code>${esc(request.documentSha256)}</code></p></div>
-<h2>Signers</h2><div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>#</th><th>Signer</th><th>Status</th><th>Signed at (UTC)</th><th></th></tr></thead><tbody>${signerRows}</tbody></table></div>
+<h2>Signers</h2><div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>#</th><th>Signer</th><th>Status</th><th>Signed at (UTC)</th><th>Executed copy</th><th></th></tr></thead><tbody>${signerRows}</tbody></table></div>
 <h2>Audit trail</h2><div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>When (UTC)</th><th>Who</th><th>Event</th><th>Detail</th></tr></thead><tbody>${eventRows || `<tr><td colspan="4" class="muted">No events yet.</td></tr>`}</tbody></table></div>`,
     { admin: true },
   );

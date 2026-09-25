@@ -50,6 +50,14 @@ export interface AuditEvent {
 export interface SignatureStore {
   createRequest(request: SignatureRequest): Promise<void>;
   getRequest(id: string): Promise<SignatureRequest | null>;
+  /**
+   * Apply a patch to one signer. When `patch.status` is "signed", this MUST be a
+   * conditional update that only succeeds if the signer is still "pending" (for
+   * example `... where id = $1 and status = 'pending'`), and MUST throw
+   * `SigningError("already_signed")` if no row changed. That check is what stops two
+   * concurrent submissions of the same signing form from both recording a signature;
+   * captureSignature's own read-then-write check cannot close that race by itself.
+   */
   updateSigner(requestId: string, signerId: string, patch: Partial<Signer>): Promise<void>;
   updateRequestStatus(requestId: string, status: RequestStatus): Promise<void>;
   appendAuditEvent(event: AuditEvent): Promise<void>;

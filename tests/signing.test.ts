@@ -19,6 +19,7 @@ class InMemoryStore implements SignatureStore {
   async updateSigner(requestId: string, signerId: string, patch: Partial<Signer>) {
     const r = this.requests.get(requestId)!;
     const signer = r.signers.find((s) => s.id === signerId)!;
+    if (patch.status === "signed" && signer.status !== "pending") throw new SigningError("already_signed", "already signed");
     Object.assign(signer, patch);
   }
   async updateRequestStatus(requestId: string, status: RequestStatus) {
@@ -166,4 +167,25 @@ test("signing without agreeing to the electronic-records disclosure is rejected"
       documentSha256Seen: request.documentSha256,
     }),
   );
+});
+
+test("two concurrent submissions of the same signing form record only one signature", async () => {
+  const { store, request, rawTokens } = await makeTwoSignerRequest();
+  const guest = request.signers[0];
+  const input = {
+    requestId: request.id,
+    signerId: guest.id,
+    token: rawTokens.get(guest.id)!,
+    typedLegalName: "Guest Person",
+    agreedToElectronicSignature: true,
+    documentSha256Seen: request.documentSha256,
+  };
+
+  const results = await Promise.allSettled([captureSignature(store, input), captureSignature(store, input)]);
+  const fulfilled = results.filter((r) => r.status === "fulfilled");
+  const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+  assert.equal(fulfilled.length, 1, "exactly one submission should succeed");
+  assert.equal(rejected.length, 1);
+  assert.ok(rejected[0].reason instanceof SigningError && rejected[0].reason.code === "already_signed");
+  assert.equal(store.auditEvents.filter((e) => e.type === "signed").length, 1, "only one signed audit event");
 });
