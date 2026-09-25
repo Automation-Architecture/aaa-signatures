@@ -119,4 +119,4 @@ Two signers only: the client and the operator.
 
 Environment: `DATABASE_URL`, `BASE_URL`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`,
 `EMAIL_FROM_EMAIL`, `EMAIL_FROM_NAME`, `ADMIN_SIGNER_NAME`, `ADMIN_SIGNER_EMAIL`.
-Run locally with `npm run dev` (reads `.env`); `npm start` runs the compiled `dist/`.
+Set `EMAIL_DEV_LOG=1` locally to log emails instead of sending them. Without it, missing SMTP credentials make every send fail. Run locally with `npm run dev` (reads `.env`); `npm start` runs the compiled `dist/`.

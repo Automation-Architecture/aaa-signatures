@@ -133,6 +133,8 @@ ${input.notice ? `<div class="ok">${esc(input.notice)}</div>` : ""}${input.error
 <div class="card">
 <a class="btn btn-secondary" href="/requests/${esc(request.id)}/original.pdf">Original PDF</a>
 ${input.hasSigned ? ` <a class="btn btn-primary" href="/requests/${esc(request.id)}/signed.pdf">Executed PDF</a>` : ""}
+${request.status === "completed" ? ` <form method="post" action="/requests/${esc(request.id)}/finalize" style="display:inline"><button class="btn btn-ghost">${input.hasSigned ? "Resend executed PDF" : "Finalize and send"}</button></form>` : ""}
+${request.status === "completed" && !input.hasSigned ? `<p class="error" style="margin-top:16px">Both parties signed, but the executed PDF hasn't been generated or sent yet. Use Finalize and send.</p>` : ""}
 ${request.status === "pending" ? ` <form method="post" action="/requests/${esc(request.id)}/void" style="display:inline" onsubmit="return confirm('Void this request? Links stop working immediately.')"><button class="btn btn-ghost">Void request</button></form>` : ""}
 <p class="muted" style="margin-top:16px">Original SHA-256: <code>${esc(input.pdfSha256)}</code><br>Record fingerprint: <code>${esc(request.documentSha256)}</code></p></div>
 <h2>Signers</h2><div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>#</th><th>Signer</th><th>Status</th><th>Signed at (UTC)</th><th></th></tr></thead><tbody>${signerRows}</tbody></table></div>
@@ -161,12 +163,12 @@ ${input.error ? `<div class="error">${esc(input.error)}</div>` : ""}
   );
 }
 
-export function signedThanksPage(input: { request: SignatureRequest; completed: boolean; nextSigner?: Signer }): string {
+export function signedThanksPage(input: { request: SignatureRequest; completed: boolean; nextSigner?: Signer; finalized?: boolean }): string {
   return layout(
     "Signed",
     `<h1>Thank you. Your signature is recorded.</h1><div class="card">
 <p><strong>${esc(input.request.title)}</strong></p>
-${input.completed ? `<p>All parties have now signed. The executed PDF, with a signature certificate, is on its way to your email.</p>` : `<p>The document is now waiting on ${esc(input.nextSigner?.name ?? "the other party")} to countersign. You will receive the fully executed copy by email once they have.</p>`}
+${input.completed ? (input.finalized === false ? `<p>All parties have now signed. Your signature is safely recorded. The executed PDF will be emailed to you shortly.</p>` : `<p>All parties have now signed. The executed PDF, with a signature certificate, is on its way to your email.</p>`) : `<p>The document is now waiting on ${esc(input.nextSigner?.name ?? "the other party")} to countersign. You will receive the fully executed copy by email once they have.</p>`}
 <p class="muted">You can close this page.</p></div>`,
   );
 }

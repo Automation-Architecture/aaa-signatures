@@ -32,6 +32,9 @@ export const config = {
     name: process.env.EMAIL_FROM_NAME ?? "Automation Architecture AI",
     email: process.env.EMAIL_FROM_EMAIL ?? "contract@automationarchitecture.ai",
   },
+  /** Local development only: log emails instead of sending. Never set in production,
+   * because the logged invite contains a live signing link. */
+  emailDevLog: process.env.EMAIL_DEV_LOG === "1",
   maxUploadBytes: 25 * 1024 * 1024,
   linkExpiresInDays: 14,
 };
