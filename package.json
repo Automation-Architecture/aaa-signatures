@@ -4,10 +4,17 @@
   "private": true,
   "description": "Reusable self-hosted e-signature flow for AAA apps: non-embedded, identity-bound signature requests with an ESIGN/UETA-oriented audit trail.",
   "type": "module",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "schema.sql"],
   "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
     "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
   },
   "engines": {
     "node": ">=22"
