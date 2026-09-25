@@ -21,7 +21,13 @@ export const config = {
     name: process.env.ADMIN_SIGNER_NAME ?? "Brad Wilcox",
     email: process.env.ADMIN_SIGNER_EMAIL ?? "brad@automationarchitecture.ai",
   },
-  brevoApiKey: process.env.BREVO_API_KEY ?? "",
+  /** Google Workspace SMTP: the mailbox that owns the contract@ alias, with an app password. */
+  smtp: {
+    host: process.env.SMTP_HOST ?? "smtp.gmail.com",
+    port: Number(process.env.SMTP_PORT ?? 465),
+    user: process.env.SMTP_USER ?? "",
+    password: process.env.SMTP_PASSWORD ?? "",
+  },
   emailFrom: {
     name: process.env.EMAIL_FROM_NAME ?? "Automation Architecture AI",
     email: process.env.EMAIL_FROM_EMAIL ?? "contract@automationarchitecture.ai",

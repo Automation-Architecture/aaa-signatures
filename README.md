@@ -8,7 +8,7 @@ designed flow covers the actual need.
 Zero runtime dependencies in the core package — plain TypeScript run directly by
 Node's built-in type stripping, no build step. Storage and email are pluggable
 interfaces a consuming app wires up to whatever it already has (Supabase, plain
-Postgres, Brevo, Resend, …); a reference Supabase adapter and Brevo email sender are
+Postgres, Brevo, Resend, …); a reference Supabase adapter and Google Workspace SMTP email (sent from the mailbox that owns contract@) sender are
 included.
 
 ## Why non-embedded
@@ -117,6 +117,6 @@ Two signers only: the client and the operator.
 - On completion the original PDF gets a signature certificate page appended (`src/server/pdf.ts`)
   and is emailed to both parties as an attachment.
 
-Environment: `DATABASE_URL`, `BASE_URL`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `BREVO_API_KEY`,
+Environment: `DATABASE_URL`, `BASE_URL`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`,
 `EMAIL_FROM_EMAIL`, `EMAIL_FROM_NAME`, `ADMIN_SIGNER_NAME`, `ADMIN_SIGNER_EMAIL`.
 Run locally with `npm run dev` (reads `.env`); `npm start` runs the compiled `dist/`.

@@ -2,6 +2,7 @@
 // for sequential signature, then deliver the executed PDF with a signature certificate.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
+import nodemailer from "nodemailer";
 import { config } from "./config.ts";
 import { PgStore } from "./store.ts";
 import { buildSignedPdf } from "./pdf.ts";
@@ -23,25 +24,28 @@ const secure = config.baseUrl.startsWith("https://");
 
 interface Attachment { name: string; content: Buffer }
 
+// Sent from the Google Workspace mailbox that owns the contract@ alias, so the sent
+// copy lands in that mailbox and replies thread there. No third party sees the contract.
+const transport = config.smtp.user && config.smtp.password
+  ? nodemailer.createTransport({
+      host: config.smtp.host, port: config.smtp.port, secure: config.smtp.port === 465,
+      auth: { user: config.smtp.user, pass: config.smtp.password },
+    })
+  : null;
+
 async function sendEmail(input: { to: { email: string; name: string }; subject: string; html: string; text: string; attachments?: Attachment[] }) {
-  if (!config.brevoApiKey) {
-    console.warn(`[email] BREVO_API_KEY not set; would have sent "${input.subject}" to ${input.to.email}\n${input.text}`);
+  if (!transport) {
+    console.warn(`[email] SMTP_USER/SMTP_PASSWORD not set; would have sent "${input.subject}" to ${input.to.email}\n${input.text}`);
     return;
   }
-  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: { "api-key": config.brevoApiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      sender: config.emailFrom,
-      to: [input.to],
-      subject: input.subject,
-      htmlContent: input.html,
-      textContent: input.text,
-      tags: ["aaa-contract"],
-      attachment: input.attachments?.map((a) => ({ name: a.name, content: a.content.toString("base64") })),
-    }),
+  await transport.sendMail({
+    from: { name: config.emailFrom.name, address: config.emailFrom.email },
+    to: { name: input.to.name, address: input.to.email },
+    subject: input.subject,
+    text: input.text,
+    html: input.html,
+    attachments: input.attachments?.map((a) => ({ filename: a.name, content: a.content, contentType: "application/pdf" })),
   });
-  if (!response.ok) throw new Error(`Brevo send failed: ${response.status} ${await response.text()}`);
 }
 
 function signingUrl(request: SignatureRequest, signer: Signer, token: string) {
