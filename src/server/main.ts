@@ -15,7 +15,8 @@ import {
 import { createSignatureRequest, issueSignerToken, nextSignerToInvite } from "../request.ts";
 import { getSigningView, captureSignature, SigningError } from "../sign.ts";
 import { verifyToken, newId } from "../token.ts";
-import { inviteEmail } from "../email.ts";
+import { inviteEmail, completedEmail } from "./emails.ts";
+import { readFileSync } from "node:fs";
 import type { SignatureRequest, Signer } from "../types.ts";
 
 const store = new PgStore(config.databaseUrl);
@@ -57,7 +58,7 @@ function signingUrl(request: SignatureRequest, signer: Signer, token: string) {
 }
 
 async function sendInvite(request: SignatureRequest, signer: Signer, token: string, isCountersigner: boolean, req?: IncomingMessage) {
-  const message = inviteEmail({ signerName: signer.name, requestTitle: request.title, signingUrl: signingUrl(request, signer, token), isCountersigner });
+  const message = inviteEmail({ baseUrl: config.baseUrl, signerName: signer.name, requestTitle: request.title, signingUrl: signingUrl(request, signer, token), isCountersigner, expiresInDays: config.linkExpiresInDays });
   await sendEmail({ to: { email: signer.email, name: signer.name }, ...message });
   await store.appendAuditEvent({
     id: newId(), requestId: request.id, signerId: signer.id, type: "sent", occurredAt: new Date().toISOString(),
@@ -114,9 +115,7 @@ async function sendCompletionEmails(requestId: string, opts: { force?: boolean }
     const filename = doc.filename.replace(/\.pdf$/i, "") + " (signed).pdf";
     const failed: string[] = [];
     for (const signer of request.signers.filter((s) => pending.has(s.id))) {
-      const subject = `Signed and complete: ${request.title}`;
-      const text = `Hi ${signer.name},\n\nEveryone has signed "${request.title}". The fully executed PDF, including the signature certificate, is attached for your records.\n\nExecuted PDF SHA-256: ${signedSha256}\n\nAutomation Architecture AI`;
-      const body = `<p>Hi ${pages.esc(signer.name)},</p><p>Everyone has signed <strong>${pages.esc(request.title)}</strong>. The fully executed PDF, including the signature certificate, is attached for your records.</p><p style="font-size:.85em;color:#636363">Executed PDF SHA-256: ${signedSha256}</p><p>Automation Architecture AI</p>`;
+      const { subject, html: body, text } = completedEmail({ baseUrl: config.baseUrl, signerName: signer.name, requestTitle: request.title, signedSha256 });
       try {
         await sendEmail({ to: { email: signer.email, name: signer.name }, subject, html: body, text, attachments: [{ name: filename, content: signedPdf }] });
         await store.recordDelivery(requestId, signer.id);
@@ -397,6 +396,12 @@ route("POST", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId
     }
     throw error;
   }
+});
+
+const brandMark = readFileSync(new URL("../../assets/mark.png", import.meta.url));
+route("GET", /^\/brand\/mark\.png$/, async (_req, res) => {
+  res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=604800" });
+  res.end(brandMark);
 });
 
 route("GET", /^\/healthz$/, async (_req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok"); });
