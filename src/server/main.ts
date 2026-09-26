@@ -37,12 +37,14 @@ const transport = config.smtp.user && config.smtp.password
   : null;
 
 async function sendEmail(input: { to: { email: string; name: string }; subject: string; html: string; text: string; attachments?: Attachment[] }) {
-  if (!transport) {
-    if (!config.emailDevLog) {
-      throw new Error("email is not configured: set SMTP_USER and SMTP_PASSWORD (or EMAIL_DEV_LOG=1 for local development)");
-    }
+  // Log-only mode wins even when SMTP credentials are present, so a developer with
+  // real credentials in .env can't send live signing links by accident.
+  if (config.emailDevLog) {
     console.warn(`[email] EMAIL_DEV_LOG: would have sent "${input.subject}" to ${input.to.email}\n${input.text}`);
     return;
+  }
+  if (!transport) {
+    throw new Error("email is not configured: set SMTP_USER and SMTP_PASSWORD (or EMAIL_DEV_LOG=1 for local development)");
   }
   await transport.sendMail({
     from: { name: config.emailFrom.name, address: config.emailFrom.email },
@@ -76,33 +78,47 @@ async function ensureSignedPdf(requestId: string) {
   if (request.status !== "completed") throw new Error("request is not completed");
   if (doc.signedPdf && doc.signedSha256) return { request, doc, signedPdf: doc.signedPdf, signedSha256: doc.signedSha256 };
 
-  const completedAt = new Date().toISOString();
+  // The contract completed when the last party signed, not when this PDF happens to
+  // be generated (which can be later, on a retry).
+  const completedAt = request.signers.map((s) => s.signedAt).filter((v): v is string => Boolean(v)).sort().at(-1);
+  if (!completedAt) throw new Error("completed request has no signing time");
   const events = await store.listAuditEvents(requestId);
   const signedPdf = await buildSignedPdf({ originalPdf: doc.pdf, request, auditEvents: events, pdfSha256: doc.pdfSha256, completedAt });
   const signedSha256 = createHash("sha256").update(signedPdf).digest("hex");
-  await store.saveSignedPdf(requestId, signedPdf, signedSha256, completedAt);
-  return { request, doc, signedPdf, signedSha256 };
+  // Only the first writer's PDF is kept. A concurrent builder loses the conditional
+  // write and uses the stored copy, so every signer gets identical bytes.
+  if (await store.saveSignedPdfIfAbsent(requestId, signedPdf, signedSha256, completedAt)) {
+    return { request, doc, signedPdf, signedSha256 };
+  }
+  const stored = await store.getDocument(requestId);
+  if (!stored?.signedPdf || !stored.signedSha256) throw new Error("executed PDF vanished after a concurrent save");
+  return { request, doc: stored, signedPdf: stored.signedPdf, signedSha256: stored.signedSha256 };
 }
 
-const finalizing = new Set<string>();
+type CompletionResult = { status: "busy" } | { status: "done"; failed: string[] };
 
 /**
  * Deliver the executed PDF to every signer who hasn't received it yet (or to every
  * signer when `force` is set, for the admin's "Resend" button). Delivery state is
  * persisted per signer, so a failure is retried by the background worker instead of
- * being lost in a log line. Returns the addresses that failed this time.
+ * being lost in a log line.
+ *
+ * Only one finalization per request runs at a time, across every app instance: a
+ * lease row in the database (expiring, so a crash can't wedge it). A caller that
+ * finds the lease taken gets "busy", never a false success.
  */
-async function sendCompletionEmails(requestId: string, opts: { force?: boolean } = {}): Promise<string[]> {
-  if (finalizing.has(requestId)) return [];
-  finalizing.add(requestId);
+async function sendCompletionEmails(requestId: string, opts: { force?: boolean } = {}): Promise<CompletionResult> {
+  const lease = await store.acquireFinalizeLease(requestId);
+  if (!lease) return { status: "busy" };
   try {
     const request = await store.getRequest(requestId);
     if (!request) throw new Error("no such request");
     await store.ensureDeliveries(requestId, request.signers.map((s) => s.id));
+    if (opts.force) await store.resetDeliveries(requestId);
     const pending = new Set(
-      (await store.listDeliveries(requestId)).filter((d) => opts.force || !d.deliveredAt).map((d) => d.signerId),
+      (await store.listDeliveries(requestId)).filter((d) => !d.deliveredAt).map((d) => d.signerId),
     );
-    if (pending.size === 0) return [];
+    if (pending.size === 0) return { status: "done", failed: [] };
 
     let built: Awaited<ReturnType<typeof ensureSignedPdf>>;
     try {
@@ -126,9 +142,9 @@ async function sendCompletionEmails(requestId: string, opts: { force?: boolean }
         failed.push(signer.email);
       }
     }
-    return failed;
+    return { status: "done", failed };
   } finally {
-    finalizing.delete(requestId);
+    await store.releaseFinalizeLease(requestId, lease);
   }
 }
 
@@ -137,8 +153,9 @@ async function retryDueDeliveries() {
   try {
     for (const requestId of await store.listDueDeliveries()) {
       try {
-        const failed = await sendCompletionEmails(requestId);
-        console.log(`[retry] request ${requestId}: ${failed.length ? `still failing for ${failed.join(", ")}` : "delivered"}`);
+        const result = await sendCompletionEmails(requestId);
+        if (result.status === "busy") continue; // another instance or request owns it right now
+        console.log(`[retry] request ${requestId}: ${result.failed.length ? `still failing for ${result.failed.join(", ")}` : "delivered"}`);
       } catch (error) {
         console.error(`[retry] request ${requestId} finalization failed`, error);
       }
@@ -328,7 +345,12 @@ route("POST", new RegExp(`^/requests/${UUID}/finalize$`), async (req, res, [id])
     return;
   }
   try {
-    const failed = await sendCompletionEmails(id!, { force: true });
+    const result = await sendCompletionEmails(id!, { force: true });
+    if (result.status === "busy") {
+      redirect(res, `/requests/${id}?error=${encodeURIComponent("The executed PDF is being sent right now. Refresh in a minute to see the result, then resend if needed.")}`);
+      return;
+    }
+    const failed = result.failed;
     const query = failed.length ? `error=${encodeURIComponent(`Executed PDF ready, but email failed for ${failed.join(", ")}.`)}` : `notice=${encodeURIComponent("Executed PDF sent to both parties.")}`;
     redirect(res, `/requests/${id}?${query}`);
   } catch (error) {
@@ -400,7 +422,9 @@ route("POST", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId
     let finalized = true;
     if (result.completed) {
       try {
-        finalized = (await sendCompletionEmails(request.id)).length === 0;
+        const outcome = await sendCompletionEmails(request.id);
+        // "busy" means another caller owns delivery and will record its outcome.
+        finalized = outcome.status === "busy" || outcome.failed.length === 0;
       } catch (error) {
         finalized = false;
         console.error(`[finalize] request ${request.id} signed but finalization failed; use "Finalize and send" on the admin page`, error);

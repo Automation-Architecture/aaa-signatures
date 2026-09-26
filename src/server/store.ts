@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 // Postgres-backed SignatureStore plus the contract-app specific tables (the uploaded
 // PDF and the final executed PDF). Schema is applied idempotently at boot.
 import pg from "pg";
@@ -45,6 +46,8 @@ create table if not exists contract_documents (
   signed_sha256 text,
   completed_at timestamptz
 );
+alter table if exists contract_documents add column if not exists finalize_lease text;
+alter table if exists contract_documents add column if not exists finalize_lease_until timestamptz;
 create table if not exists contract_deliveries (
   request_id      uuid not null references signature_requests(id) on delete cascade,
   signer_id       uuid not null references signature_signers(id) on delete cascade,
@@ -54,6 +57,7 @@ create table if not exists contract_deliveries (
   last_error      text,
   primary key (request_id, signer_id)
 );
+alter table contract_deliveries add column if not exists first_delivered_at timestamptz;
 
 -- The audit trail is evidence only if it can't be changed after the fact. The app's
 -- role owns these tables, so REVOKE alone would not bind it; a trigger refuses every
@@ -289,6 +293,7 @@ export class PgStore implements SignatureStore {
       `update contract_deliveries
           set attempts = attempts + 1, last_attempt_at = now(),
               delivered_at = case when $3::text is null then now() else delivered_at end,
+              first_delivered_at = case when $3::text is null then coalesce(first_delivered_at, now()) else first_delivered_at end,
               last_error = $3
         where request_id = $1 and signer_id = $2`,
       [requestId, signerId, error ?? null],
@@ -304,16 +309,57 @@ export class PgStore implements SignatureStore {
          join signature_requests r on r.id = d.request_id
         where r.status = 'completed' and d.delivered_at is null and d.attempts < $1
           and (d.last_attempt_at is null
-               or d.last_attempt_at < now() - least(interval '6 hours', interval '2 minutes' * power(2, d.attempts)))`,
+               or d.last_attempt_at < now() - least(interval '6 hours', interval '2 minutes' * power(2, d.attempts)))
+       union
+       -- Completed requests that never got delivery rows (the process stopped between
+       -- the final signature and the first delivery attempt). The executed-PDF check
+       -- skips requests finalized before delivery tracking existed.
+       select r.id from signature_requests r
+         join contract_documents c on c.request_id = r.id
+        where r.status = 'completed' and c.signed_pdf is null
+          and not exists (select 1 from contract_deliveries d where d.request_id = r.id)`,
       [MAX_DELIVERY_ATTEMPTS],
     );
     return rows.map((r) => r.request_id);
   }
 
-  async saveSignedPdf(requestId: string, signedPdf: Buffer, signedSha256: string, completedAt: string): Promise<void> {
+  /** A forced resend makes every copy pending again. first_delivered_at keeps the
+   * record of the original delivery; a failed resend is then shown and retried. */
+  async resetDeliveries(requestId: string): Promise<void> {
     await this.pool.query(
-      "update contract_documents set signed_pdf = $2, signed_sha256 = $3, completed_at = $4 where request_id = $1",
-      [requestId, signedPdf, signedSha256, completedAt],
+      "update contract_deliveries set delivered_at = null, attempts = 0, last_attempt_at = null, last_error = null where request_id = $1",
+      [requestId],
     );
   }
+
+  /** Take the per-request finalization lease if it is free or expired. Returns the
+   * lease token to release with, or null when someone else holds it. */
+  async acquireFinalizeLease(requestId: string, ttlSeconds = 300): Promise<string | null> {
+    const token = randomUUID();
+    const result = await this.pool.query(
+      `update contract_documents set finalize_lease = $2, finalize_lease_until = now() + ($3 || ' seconds')::interval
+        where request_id = $1 and (finalize_lease is null or finalize_lease_until < now())`,
+      [requestId, token, String(ttlSeconds)],
+    );
+    return result.rowCount === 1 ? token : null;
+  }
+
+  async releaseFinalizeLease(requestId: string, token: string): Promise<void> {
+    await this.pool.query(
+      "update contract_documents set finalize_lease = null, finalize_lease_until = null where request_id = $1 and finalize_lease = $2",
+      [requestId, token],
+    );
+  }
+
+  /** Store the executed PDF only if none exists yet. Returns false if another writer
+   * got there first, in which case the caller must use the stored copy. */
+  async saveSignedPdfIfAbsent(requestId: string, signedPdf: Buffer, signedSha256: string, completedAt: string): Promise<boolean> {
+    const result = await this.pool.query(
+      "update contract_documents set signed_pdf = $2, signed_sha256 = $3, completed_at = $4 where request_id = $1 and signed_pdf is null",
+      [requestId, signedPdf, signedSha256, completedAt],
+    );
+    return result.rowCount === 1;
+  }
+
+
 }
