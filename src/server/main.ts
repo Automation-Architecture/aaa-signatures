@@ -3,18 +3,21 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import nodemailer from "nodemailer";
-import { config } from "./config.ts";
+import { PDFDocument } from "pdf-lib";
+import { config, googleEnabled } from "./config.ts";
+import { beginGoogleLogin, completeGoogleLogin } from "./google.ts";
 import { PgStore } from "./store.ts";
 import { buildSignedPdf } from "./pdf.ts";
 import * as pages from "./pages.ts";
 import {
-  HttpError, clientIp, userAgent, readBody, parseMultipart, parseForm, isAdmin, setSessionCookie,
+  HttpError, clientIp, userAgent, readBody, parseMultipart, parseForm, readSession, setSessionCookie,
   clearSessionCookie, constantTimeEqual, html, redirect,
 } from "./http.ts";
 import { createSignatureRequest, issueSignerToken, nextSignerToInvite } from "../request.ts";
 import { getSigningView, captureSignature, SigningError } from "../sign.ts";
 import { verifyToken, newId } from "../token.ts";
-import { inviteEmail } from "../email.ts";
+import { inviteEmail, completedEmail } from "./emails.ts";
+import { readFileSync } from "node:fs";
 import type { SignatureRequest, Signer } from "../types.ts";
 
 const store = new PgStore(config.databaseUrl);
@@ -34,9 +37,14 @@ const transport = config.smtp.user && config.smtp.password
   : null;
 
 async function sendEmail(input: { to: { email: string; name: string }; subject: string; html: string; text: string; attachments?: Attachment[] }) {
-  if (!transport) {
-    console.warn(`[email] SMTP_USER/SMTP_PASSWORD not set; would have sent "${input.subject}" to ${input.to.email}\n${input.text}`);
+  // Log-only mode wins even when SMTP credentials are present, so a developer with
+  // real credentials in .env can't send live signing links by accident.
+  if (config.emailDevLog) {
+    console.warn(`[email] EMAIL_DEV_LOG: would have sent "${input.subject}" to ${input.to.email}\n${input.text}`);
     return;
+  }
+  if (!transport) {
+    throw new Error("email is not configured: set SMTP_USER and SMTP_PASSWORD (or EMAIL_DEV_LOG=1 for local development)");
   }
   await transport.sendMail({
     from: { name: config.emailFrom.name, address: config.emailFrom.email },
@@ -53,7 +61,7 @@ function signingUrl(request: SignatureRequest, signer: Signer, token: string) {
 }
 
 async function sendInvite(request: SignatureRequest, signer: Signer, token: string, isCountersigner: boolean, req?: IncomingMessage) {
-  const message = inviteEmail({ signerName: signer.name, requestTitle: request.title, signingUrl: signingUrl(request, signer, token), isCountersigner });
+  const message = inviteEmail({ baseUrl: config.baseUrl, signerName: signer.name, requestTitle: request.title, signingUrl: signingUrl(request, signer, token), isCountersigner, expiresInDays: config.linkExpiresInDays });
   await sendEmail({ to: { email: signer.email, name: signer.name }, ...message });
   await store.appendAuditEvent({
     id: newId(), requestId: request.id, signerId: signer.id, type: "sent", occurredAt: new Date().toISOString(),
@@ -61,26 +69,99 @@ async function sendInvite(request: SignatureRequest, signer: Signer, token: stri
   });
 }
 
-async function completeRequest(requestId: string) {
+/** Build and store the executed PDF if it doesn't exist yet. Safe to call again: an
+ * existing executed PDF is reused, so its bytes and fingerprint never change. */
+async function ensureSignedPdf(requestId: string) {
   const request = await store.getRequest(requestId);
   const doc = await store.getDocument(requestId);
   if (!request || !doc) throw new Error("request or document missing at completion");
-  const completedAt = new Date().toISOString();
+  if (request.status !== "completed") throw new Error("request is not completed");
+  if (doc.signedPdf && doc.signedSha256) return { request, doc, signedPdf: doc.signedPdf, signedSha256: doc.signedSha256 };
+
+  // The contract completed when the last party signed, not when this PDF happens to
+  // be generated (which can be later, on a retry).
+  const completedAt = request.signers.map((s) => s.signedAt).filter((v): v is string => Boolean(v)).sort().at(-1);
+  if (!completedAt) throw new Error("completed request has no signing time");
   const events = await store.listAuditEvents(requestId);
   const signedPdf = await buildSignedPdf({ originalPdf: doc.pdf, request, auditEvents: events, pdfSha256: doc.pdfSha256, completedAt });
   const signedSha256 = createHash("sha256").update(signedPdf).digest("hex");
-  await store.saveSignedPdf(requestId, signedPdf, signedSha256, completedAt);
+  // Only the first writer's PDF is kept. A concurrent builder loses the conditional
+  // write and uses the stored copy, so every signer gets identical bytes.
+  if (await store.saveSignedPdfIfAbsent(requestId, signedPdf, signedSha256, completedAt)) {
+    return { request, doc, signedPdf, signedSha256 };
+  }
+  const stored = await store.getDocument(requestId);
+  if (!stored?.signedPdf || !stored.signedSha256) throw new Error("executed PDF vanished after a concurrent save");
+  return { request, doc: stored, signedPdf: stored.signedPdf, signedSha256: stored.signedSha256 };
+}
 
-  const filename = doc.filename.replace(/\.pdf$/i, "") + " (signed).pdf";
-  for (const signer of request.signers) {
-    const subject = `Signed and complete: ${request.title}`;
-    const text = `Hi ${signer.name},\n\nEveryone has signed "${request.title}". The fully executed PDF, including the signature certificate, is attached for your records.\n\nExecuted PDF SHA-256: ${signedSha256}\n\nAutomation Architecture AI`;
-    const body = `<p>Hi ${pages.esc(signer.name)},</p><p>Everyone has signed <strong>${pages.esc(request.title)}</strong>. The fully executed PDF, including the signature certificate, is attached for your records.</p><p style="font-size:.85em;color:#636363">Executed PDF SHA-256: ${signedSha256}</p><p>Automation Architecture AI</p>`;
+type CompletionResult = { status: "busy" } | { status: "done"; failed: string[] };
+
+/**
+ * Deliver the executed PDF to every signer who hasn't received it yet (or to every
+ * signer when `force` is set, for the admin's "Resend" button). Delivery state is
+ * persisted per signer, so a failure is retried by the background worker instead of
+ * being lost in a log line.
+ *
+ * Only one finalization per request runs at a time, across every app instance: a
+ * lease row in the database (expiring, so a crash can't wedge it). A caller that
+ * finds the lease taken gets "busy", never a false success.
+ */
+async function sendCompletionEmails(requestId: string, opts: { force?: boolean } = {}): Promise<CompletionResult> {
+  const lease = await store.acquireFinalizeLease(requestId);
+  if (!lease) return { status: "busy" };
+  try {
+    const request = await store.getRequest(requestId);
+    if (!request) throw new Error("no such request");
+    await store.ensureDeliveries(requestId, request.signers.map((s) => s.id));
+    if (opts.force) await store.resetDeliveries(requestId);
+    const pending = new Set(
+      (await store.listDeliveries(requestId)).filter((d) => !d.deliveredAt).map((d) => d.signerId),
+    );
+    if (pending.size === 0) return { status: "done", failed: [] };
+
+    let built: Awaited<ReturnType<typeof ensureSignedPdf>>;
     try {
-      await sendEmail({ to: { email: signer.email, name: signer.name }, subject, html: body, text, attachments: [{ name: filename, content: signedPdf }] });
+      built = await ensureSignedPdf(requestId);
     } catch (error) {
-      console.error(`[email] completion email to ${signer.email} failed`, error);
+      const message = `could not build executed PDF: ${error instanceof Error ? error.message : String(error)}`;
+      for (const signerId of pending) await store.recordDelivery(requestId, signerId, message);
+      throw error;
     }
+    const { doc, signedPdf, signedSha256 } = built;
+    const filename = doc.filename.replace(/\.pdf$/i, "") + " (signed).pdf";
+    const failed: string[] = [];
+    for (const signer of request.signers.filter((s) => pending.has(s.id))) {
+      const { subject, html: body, text } = completedEmail({ baseUrl: config.baseUrl, signerName: signer.name, requestTitle: request.title, signedSha256 });
+      try {
+        await sendEmail({ to: { email: signer.email, name: signer.name }, subject, html: body, text, attachments: [{ name: filename, content: signedPdf }] });
+        await store.recordDelivery(requestId, signer.id);
+      } catch (error) {
+        console.error(`[email] completion email to ${signer.email} failed`, error);
+        await store.recordDelivery(requestId, signer.id, error instanceof Error ? error.message : String(error));
+        failed.push(signer.email);
+      }
+    }
+    return { status: "done", failed };
+  } finally {
+    await store.releaseFinalizeLease(requestId, lease);
+  }
+}
+
+/** Background retry for completion deliveries that failed. */
+async function retryDueDeliveries() {
+  try {
+    for (const requestId of await store.listDueDeliveries()) {
+      try {
+        const result = await sendCompletionEmails(requestId);
+        if (result.status === "busy") continue; // another instance or request owns it right now
+        console.log(`[retry] request ${requestId}: ${result.failed.length ? `still failing for ${result.failed.join(", ")}` : "delivered"}`);
+      } catch (error) {
+        console.error(`[retry] request ${requestId} finalization failed`, error);
+      }
+    }
+  } catch (error) {
+    console.error("[retry] could not list due deliveries", error);
   }
 }
 
@@ -93,8 +174,11 @@ const route = (method: string, pattern: RegExp, handler: Handler) => routes.push
 const UUID = "([0-9a-f-]{36})";
 
 function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
-  if (isAdmin(req, config.sessionSecret)) return true;
-  html(res, 200, pages.loginPage());
+  const session = readSession(req, config.sessionSecret);
+  // Re-check the allowlist on every request, so removing an address from
+  // ALLOWED_EMAILS ends that person's existing sessions too.
+  if (session && (session.email === "password" ? !googleEnabled : config.allowedEmails.includes(session.email))) return true;
+  html(res, 200, pages.loginPage({ google: googleEnabled }));
   return false;
 }
 
@@ -106,23 +190,42 @@ route("GET", /^\/$/, async (req, res, _p, url) => {
 });
 
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+route("GET", /^\/auth\/google$/, async (_req, res) => {
+  if (!googleEnabled) throw new HttpError(404, "Google sign-in is not configured");
+  redirect(res, beginGoogleLogin(res, secure));
+});
+
+route("GET", /^\/auth\/google\/callback$/, async (req, res, _p, url) => {
+  if (!googleEnabled) throw new HttpError(404, "Google sign-in is not configured");
+  const result = await completeGoogleLogin(req, url, res);
+  if (!result.ok) {
+    html(res, 403, pages.loginPage({ google: true, error: result.reason }));
+    return;
+  }
+  console.log(`[auth] signed in ${result.email}`);
+  setSessionCookie(res, config.sessionSecret, secure, result.email);
+  redirect(res, "/");
+});
+
+// Password login only exists until Google sign-in is configured.
 route("POST", /^\/login$/, async (req, res) => {
+  if (googleEnabled) throw new HttpError(404, "password sign-in is disabled");
   const ip = clientIp(req) ?? "unknown";
   const now = Date.now();
   const attempt = loginAttempts.get(ip);
   if (attempt && attempt.resetAt > now && attempt.count >= 10) {
-    html(res, 429, pages.loginPage("Too many attempts. Try again in 15 minutes."));
+    html(res, 429, pages.loginPage({ google: false, error: "Too many attempts. Try again in 15 minutes." }));
     return;
   }
   const form = parseForm(await readBody(req, 4096));
   if (constantTimeEqual(form.password ?? "", config.adminPassword)) {
     loginAttempts.delete(ip);
-    setSessionCookie(res, config.sessionSecret, secure);
+    setSessionCookie(res, config.sessionSecret, secure, "password");
     redirect(res, "/");
     return;
   }
   loginAttempts.set(ip, { count: (attempt && attempt.resetAt > now ? attempt.count : 0) + 1, resetAt: now + 15 * 60 * 1000 });
-  html(res, 401, pages.loginPage("Wrong password."));
+  html(res, 401, pages.loginPage({ google: false, error: "Wrong password." }));
 });
 
 route("POST", /^\/logout$/, async (_req, res) => {
@@ -151,6 +254,18 @@ route("POST", /^\/requests$/, async (req, res) => {
   }
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clientEmail)) {
     redirect(res, `/?error=${encodeURIComponent("Client email does not look valid.")}`);
+    return;
+  }
+
+  // Do the same work finalization will do (parse, add a page, save) so a PDF that
+  // would break the executed record is refused now, not after both parties sign.
+  try {
+    const probe = await PDFDocument.load(file.data, { ignoreEncryption: true });
+    if (probe.getPageCount() === 0) throw new Error("no pages");
+    probe.addPage();
+    await probe.save();
+  } catch {
+    redirect(res, `/?error=${encodeURIComponent("That PDF could not be read. Re-export it and try again.")}`);
     return;
   }
 
@@ -188,8 +303,9 @@ route("GET", new RegExp(`^/requests/${UUID}$`), async (req, res, [id], url) => {
   const doc = await store.getDocument(id!);
   if (!request || !doc) throw new HttpError(404, "no such request");
   const events = await store.listAuditEvents(id!);
+  const deliveries = await store.listDeliveries(id!);
   html(res, 200, pages.requestDetailPage({
-    request, events, filename: doc.filename, pdfSha256: doc.pdfSha256, hasSigned: Boolean(doc.signedPdf),
+    request, events, deliveries, filename: doc.filename, pdfSha256: doc.pdfSha256, hasSigned: Boolean(doc.signedPdf),
     notice: url.searchParams.get("notice") ?? undefined, error: url.searchParams.get("error") ?? undefined,
   }));
 });
@@ -218,6 +334,29 @@ route("POST", new RegExp(`^/requests/${UUID}/resend$`), async (req, res, [id]) =
   const token = await issueSignerToken(store, request.id, next.id, config.linkExpiresInDays);
   await sendInvite(request, next, token, next.order > 0, req);
   redirect(res, `/requests/${id}?notice=${encodeURIComponent(`New link sent to ${next.email}. Older links no longer work.`)}`);
+});
+
+route("POST", new RegExp(`^/requests/${UUID}/finalize$`), async (req, res, [id]) => {
+  if (!requireAdmin(req, res)) return;
+  const request = await store.getRequest(id!);
+  if (!request) throw new HttpError(404, "no such request");
+  if (request.status !== "completed") {
+    redirect(res, `/requests/${id}?error=${encodeURIComponent("Not every party has signed yet.")}`);
+    return;
+  }
+  try {
+    const result = await sendCompletionEmails(id!, { force: true });
+    if (result.status === "busy") {
+      redirect(res, `/requests/${id}?error=${encodeURIComponent("The executed PDF is being sent right now. Refresh in a minute to see the result, then resend if needed.")}`);
+      return;
+    }
+    const failed = result.failed;
+    const query = failed.length ? `error=${encodeURIComponent(`Executed PDF ready, but email failed for ${failed.join(", ")}.`)}` : `notice=${encodeURIComponent("Executed PDF sent to both parties.")}`;
+    redirect(res, `/requests/${id}?${query}`);
+  } catch (error) {
+    console.error(`[finalize] retry for ${id} failed`, error);
+    redirect(res, `/requests/${id}?error=${encodeURIComponent(`Could not build the executed PDF: ${error instanceof Error ? error.message : "unknown error"}`)}`);
+  }
 });
 
 route("POST", new RegExp(`^/requests/${UUID}/void$`), async (req, res, [id]) => {
@@ -258,6 +397,12 @@ route("GET", new RegExp(`^/sign/${UUID}/${UUID}/document\\.pdf$`), async (_req, 
   const request = await store.getRequest(requestId!);
   const signer = request?.signers.find((s) => s.id === signerId);
   if (!request || !signer || !verifyToken(token, signer.tokenHash)) throw new HttpError(403, "not allowed");
+  // Same rules as the signing page: a link stops working once the request is voided,
+  // the token expires, the signer has signed, or it isn't their turn.
+  if (request.status !== "pending" || signer.status !== "pending" || new Date(signer.tokenExpiresAt).getTime() < Date.now()) {
+    throw new HttpError(403, "this link is no longer valid");
+  }
+  if (nextSignerToInvite(request)?.id !== signer.id) throw new HttpError(403, "this link is no longer valid");
   const doc = await store.getDocument(request.id);
   if (!doc) throw new HttpError(404, "missing document");
   res.writeHead(200, { "Content-Type": "application/pdf", "Content-Disposition": `inline; filename="${doc.filename.replace(/"/g, "")}"`, "Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN" });
@@ -274,13 +419,21 @@ route("POST", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId
       documentSha256Seen: form.documentSha256Seen ?? "", ip: clientIp(req), userAgent: userAgent(req),
     });
     const request = (await store.getRequest(requestId!))!;
+    let finalized = true;
     if (result.completed) {
-      await completeRequest(request.id);
+      try {
+        const outcome = await sendCompletionEmails(request.id);
+        // "busy" means another caller owns delivery and will record its outcome.
+        finalized = outcome.status === "busy" || outcome.failed.length === 0;
+      } catch (error) {
+        finalized = false;
+        console.error(`[finalize] request ${request.id} signed but finalization failed; use "Finalize and send" on the admin page`, error);
+      }
     } else if (result.nextSigner) {
       const token = await issueSignerToken(store, request.id, result.nextSigner.id, config.linkExpiresInDays);
       try { await sendInvite(request, result.nextSigner, token, true); } catch (error) { console.error("[email] countersign invite failed", error); }
     }
-    html(res, 200, pages.signedThanksPage({ request, completed: result.completed, nextSigner: result.nextSigner }));
+    html(res, 200, pages.signedThanksPage({ request, completed: result.completed, nextSigner: result.nextSigner, finalized }));
   } catch (error) {
     if (error instanceof SigningError) { html(res, 403, pages.messagePage("Cannot sign this document", signingErrorMessage(error))); return; }
     const message = error instanceof Error ? error.message : "unknown error";
@@ -290,6 +443,12 @@ route("POST", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId
     }
     throw error;
   }
+});
+
+const brandMark = readFileSync(new URL("../../assets/mark.png", import.meta.url));
+route("GET", /^\/brand\/mark\.png$/, async (_req, res) => {
+  res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=604800" });
+  res.end(brandMark);
 });
 
 route("GET", /^\/healthz$/, async (_req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok"); });
@@ -312,6 +471,9 @@ const server = createServer(async (req, res) => {
   }
 });
 
+if (!transport && !config.emailDevLog) console.error("[email] SMTP_USER/SMTP_PASSWORD not set: every send will fail until they are");
+
 store.migrate().then(() => {
+  setInterval(retryDueDeliveries, Number(process.env.DELIVERY_RETRY_INTERVAL_MS ?? 60_000)).unref();
   server.listen(config.port, () => console.log(`contract app listening on :${config.port} (${config.baseUrl})`));
 }).catch((error) => { console.error("failed to start", error); process.exit(1); });

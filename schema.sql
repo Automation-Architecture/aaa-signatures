@@ -49,3 +49,13 @@ create index if not exists signature_audit_events_request_id_idx on signature_au
 -- In Supabase, do this via RLS + explicit grants rather than relying on default
 -- table privileges, and keep it out of any migration a future "just clean this up"
 -- pass might loosen.
+
+-- If the app's role owns the table (common on Railway or a single-role Postgres),
+-- REVOKE does not bind the owner. A trigger does:
+--
+--   create or replace function signature_audit_events_append_only() returns trigger
+--   language plpgsql as $$ begin raise exception 'signature_audit_events is append-only: % is not allowed', tg_op; end; $$;
+--   create trigger signature_audit_events_no_update_delete before update or delete on signature_audit_events
+--     for each row execute function signature_audit_events_append_only();
+--   create trigger signature_audit_events_no_truncate before truncate on signature_audit_events
+--     for each statement execute function signature_audit_events_append_only();

@@ -3,13 +3,20 @@
 // already has @supabase/supabase-js and its own client setup) and adjust as needed.
 //
 // import type { SupabaseClient } from "@supabase/supabase-js";
+import { SigningError } from "../sign.ts";
 import type { AuditEvent, RequestStatus, SignatureRequest, SignatureStore, Signer } from "../types.ts";
+
+type UpdateResult = { error: unknown; data?: unknown };
+type UpdateBuilder = PromiseLike<UpdateResult> & {
+  eq(column: string, value: unknown): UpdateBuilder;
+  select(columns: string): PromiseLike<UpdateResult>;
+};
 
 type SupabaseClientLike = {
   from(table: string): {
     insert(row: unknown): Promise<{ error: unknown }>;
     select(columns: string): { eq(column: string, value: unknown): Promise<{ data: unknown; error: unknown }> };
-    update(patch: unknown): { eq(column: string, value: unknown): Promise<{ error: unknown }> };
+    update(patch: unknown): UpdateBuilder;
   };
 };
 
@@ -93,6 +100,15 @@ export class SupabaseSignatureStore implements SignatureStore {
     const row: Record<string, unknown> = {};
     if (patch.status) row.status = patch.status;
     if (patch.signedAt) row.signed_at = patch.signedAt;
+    if (patch.tokenHash) row.token_hash = patch.tokenHash;
+    if (patch.tokenExpiresAt) row.token_expires_at = patch.tokenExpiresAt;
+    if (patch.status === "signed") {
+      // Conditional transition: see SignatureStore.updateSigner.
+      const { data, error } = await this.client.from("signature_signers").update(row).eq("id", signerId).eq("status", "pending").select("id");
+      if (error) throw error;
+      if (!Array.isArray(data) || data.length === 0) throw new SigningError("already_signed", "already signed");
+      return;
+    }
     const { error } = await this.client.from("signature_signers").update(row).eq("id", signerId);
     if (error) throw error;
   }

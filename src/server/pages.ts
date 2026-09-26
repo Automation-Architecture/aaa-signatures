@@ -1,6 +1,6 @@
 // Server-rendered pages. Brand: Automation-Architecture/aaa-brand DESIGN.md (Jura, teal, lime accent).
 import type { AuditEvent, SignatureRequest, Signer } from "../types.ts";
-import type { RequestSummary } from "./store.ts";
+import { MAX_DELIVERY_ATTEMPTS, type Delivery, type RequestSummary } from "./store.ts";
 
 export function esc(value: unknown): string {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -60,11 +60,16 @@ ${opts.admin ? `<form method="post" action="/logout" style="margin:0"><button cl
 </body></html>`;
 }
 
-export function loginPage(error?: string): string {
+export function loginPage(input: { google: boolean; error?: string }): string {
+  const googleButton = `<a class="btn btn-primary" href="/auth/google" style="display:inline-flex;align-items:center;gap:10px">
+<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#010101" d="M44.5 20H24v8.5h11.8C34.7 33.9 30.1 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 4.1 29.6 2 24 2 11.8 2 2 11.8 2 24s9.8 22 22 22c11 0 21-8 21-22 0-1.3-.2-2.7-.5-4z"/></svg>
+Sign in with Google</a>
+<p class="muted" style="margin-top:16px">Use your Automation Architecture AI Google account.</p>`;
+  const passwordForm = `<form method="post" action="/login"><label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required autofocus>
+<div style="margin-top:20px"><button class="btn btn-primary">Sign in</button></div></form>`;
   return layout("Sign in", `<h1>Sign in</h1><div class="card" style="max-width:420px">
-${error ? `<div class="error">${esc(error)}</div>` : ""}
-<form method="post" action="/login"><label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required autofocus>
-<div style="margin-top:20px"><button class="btn btn-primary">Sign in</button></div></form></div>`);
+${input.error ? `<div class="error">${esc(input.error)}</div>` : ""}
+${input.google ? googleButton : passwordForm}</div>`);
 }
 
 export function adminPage(input: { requests: RequestSummary[]; adminSigner: { name: string; email: string }; notice?: string; error?: string }): string {
@@ -101,6 +106,7 @@ export function adminPage(input: { requests: RequestSummary[]; adminSigner: { na
 export function requestDetailPage(input: {
   request: SignatureRequest;
   events: AuditEvent[];
+  deliveries: Delivery[];
   filename: string;
   pdfSha256: string;
   hasSigned: boolean;
@@ -109,11 +115,19 @@ export function requestDetailPage(input: {
 }): string {
   const { request } = input;
   const byId = new Map(request.signers.map((s) => [s.id, s]));
+  const deliveryBySigner = new Map(input.deliveries.map((d) => [d.signerId, d]));
+  const deliveryCell = (signerId: string) => {
+    const d = deliveryBySigner.get(signerId);
+    if (!d) return request.status === "completed" ? `<span class="muted">not recorded</span>` : "";
+    if (d.deliveredAt) return `<span class="pill signed">sent</span><br><span class="muted">${esc(d.deliveredAt)}</span>`;
+    const retrying = d.attempts < MAX_DELIVERY_ATTEMPTS;
+    return `<span class="pill voided">${retrying ? "retrying" : "failed"}</span><br><span class="muted">${d.attempts} attempt${d.attempts === 1 ? "" : "s"}${d.lastError ? `: ${esc(d.lastError.slice(0, 160))}` : ""}</span>`;
+  };
   const signerRows = [...request.signers]
     .sort((a, b) => a.order - b.order)
     .map(
       (s) => `<tr><td>${s.order + 1}</td><td>${esc(s.name)}<br><span class="muted">${esc(s.email)}</span></td>
-<td><span class="pill ${esc(s.status)}">${esc(s.status)}</span></td><td>${esc(s.signedAt ?? "")}</td>
+<td><span class="pill ${esc(s.status)}">${esc(s.status)}</span></td><td>${esc(s.signedAt ?? "")}</td><td>${deliveryCell(s.id)}</td>
 <td>${s.status === "pending" && request.status === "pending" ? `<form method="post" action="/requests/${esc(request.id)}/resend" style="margin:0"><input type="hidden" name="signerId" value="${esc(s.id)}"><button class="btn btn-ghost">Resend link</button></form>` : ""}</td></tr>`,
     )
     .join("");
@@ -133,9 +147,11 @@ ${input.notice ? `<div class="ok">${esc(input.notice)}</div>` : ""}${input.error
 <div class="card">
 <a class="btn btn-secondary" href="/requests/${esc(request.id)}/original.pdf">Original PDF</a>
 ${input.hasSigned ? ` <a class="btn btn-primary" href="/requests/${esc(request.id)}/signed.pdf">Executed PDF</a>` : ""}
+${request.status === "completed" ? ` <form method="post" action="/requests/${esc(request.id)}/finalize" style="display:inline"><button class="btn btn-ghost">${input.hasSigned ? "Resend executed PDF" : "Finalize and send"}</button></form>` : ""}
+${request.status === "completed" && !input.hasSigned ? `<p class="error" style="margin-top:16px">Both parties signed, but the executed PDF hasn't been generated or sent yet. Use Finalize and send.</p>` : ""}
 ${request.status === "pending" ? ` <form method="post" action="/requests/${esc(request.id)}/void" style="display:inline" onsubmit="return confirm('Void this request? Links stop working immediately.')"><button class="btn btn-ghost">Void request</button></form>` : ""}
 <p class="muted" style="margin-top:16px">Original SHA-256: <code>${esc(input.pdfSha256)}</code><br>Record fingerprint: <code>${esc(request.documentSha256)}</code></p></div>
-<h2>Signers</h2><div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>#</th><th>Signer</th><th>Status</th><th>Signed at (UTC)</th><th></th></tr></thead><tbody>${signerRows}</tbody></table></div>
+<h2>Signers</h2><div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>#</th><th>Signer</th><th>Status</th><th>Signed at (UTC)</th><th>Executed copy</th><th></th></tr></thead><tbody>${signerRows}</tbody></table></div>
 <h2>Audit trail</h2><div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>When (UTC)</th><th>Who</th><th>Event</th><th>Detail</th></tr></thead><tbody>${eventRows || `<tr><td colspan="4" class="muted">No events yet.</td></tr>`}</tbody></table></div>`,
     { admin: true },
   );
@@ -161,12 +177,12 @@ ${input.error ? `<div class="error">${esc(input.error)}</div>` : ""}
   );
 }
 
-export function signedThanksPage(input: { request: SignatureRequest; completed: boolean; nextSigner?: Signer }): string {
+export function signedThanksPage(input: { request: SignatureRequest; completed: boolean; nextSigner?: Signer; finalized?: boolean }): string {
   return layout(
     "Signed",
     `<h1>Thank you. Your signature is recorded.</h1><div class="card">
 <p><strong>${esc(input.request.title)}</strong></p>
-${input.completed ? `<p>All parties have now signed. The executed PDF, with a signature certificate, is on its way to your email.</p>` : `<p>The document is now waiting on ${esc(input.nextSigner?.name ?? "the other party")} to countersign. You will receive the fully executed copy by email once they have.</p>`}
+${input.completed ? (input.finalized === false ? `<p>All parties have now signed. Your signature is safely recorded. The executed PDF will be emailed to you shortly.</p>` : `<p>All parties have now signed. The executed PDF, with a signature certificate, is on its way to your email.</p>`) : `<p>The document is now waiting on ${esc(input.nextSigner?.name ?? "the other party")} to countersign. You will receive the fully executed copy by email once they have.</p>`}
 <p class="muted">You can close this page.</p></div>`,
   );
 }
