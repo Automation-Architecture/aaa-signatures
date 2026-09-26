@@ -83,27 +83,42 @@ export function parseCookies(req: IncomingMessage): Record<string, string> {
   return out;
 }
 
-const SESSION_COOKIE = "aaa_contract_admin";
+const SESSION_COOKIE = "aaa_contract_session";
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 
-export function sessionValue(secret: string): string {
-  return createHmac("sha256", secret).update("admin-session-v1").digest("base64url");
+function sign(secret: string, payload: string): string {
+  return createHmac("sha256", secret).update(payload).digest("base64url");
 }
 
-export function isAdmin(req: IncomingMessage, secret: string): boolean {
+/** A signed "who, until when" cookie. The identity is shown in the header and
+ * recorded; a session can't outlive its expiry even if the cookie is kept. */
+export function sessionValue(secret: string, email: string, expiresAt: number): string {
+  const payload = Buffer.from(JSON.stringify({ e: email, x: expiresAt })).toString("base64url");
+  return `${payload}.${sign(secret, payload)}`;
+}
+
+export function readSession(req: IncomingMessage, secret: string): { email: string } | null {
   const presented = parseCookies(req)[SESSION_COOKIE];
-  if (!presented) return false;
-  const expected = Buffer.from(sessionValue(secret));
-  const candidate = Buffer.from(presented);
-  return candidate.length === expected.length && timingSafeEqual(candidate, expected);
+  if (!presented) return null;
+  const [payload, signature] = presented.split(".");
+  if (!payload || !signature || !constantTimeEqual(signature, sign(secret, payload))) return null;
+  try {
+    const { e, x } = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (typeof e !== "string" || typeof x !== "number" || x < Date.now()) return null;
+    return { email: e };
+  } catch {
+    return null;
+  }
 }
 
-export function setSessionCookie(res: ServerResponse, secret: string, secure: boolean): void {
-  const flags = `Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}${secure ? "; Secure" : ""}`;
-  res.setHeader("Set-Cookie", `${SESSION_COOKIE}=${sessionValue(secret)}; ${flags}`);
+export function setSessionCookie(res: ServerResponse, secret: string, secure: boolean, email: string): void {
+  const value = sessionValue(secret, email, Date.now() + SESSION_TTL_SECONDS * 1000);
+  const flags = `Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}${secure ? "; Secure" : ""}`;
+  res.appendHeader("Set-Cookie", `${SESSION_COOKIE}=${value}; ${flags}`);
 }
 
 export function clearSessionCookie(res: ServerResponse): void {
-  res.setHeader("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0`);
+  res.appendHeader("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0`);
 }
 
 export function constantTimeEqual(a: string, b: string): boolean {

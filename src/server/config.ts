@@ -13,7 +13,18 @@ export const config = {
   baseUrl: (process.env.BASE_URL ?? `http://localhost:${process.env.PORT ?? 3000}`).replace(/\/$/, ""),
   databaseUrl: required("DATABASE_URL"),
   /** Single-operator admin: the upload page is behind this password. */
-  adminPassword: required("ADMIN_PASSWORD"),
+  /** Fallback login, used only while Google sign-in isn't configured. */
+  adminPassword: process.env.ADMIN_PASSWORD ?? "",
+  /** Google sign-in, matching the other internal AAA tools (invoices): a Google
+   * OAuth web client on the workspace's Internal consent screen, and an allowlist. */
+  google: {
+    clientId: process.env.GOOGLE_CLIENT_ID ?? "",
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? "",
+    hostedDomain: process.env.GOOGLE_HOSTED_DOMAIN ?? "automationarchitecture.ai",
+    tokenUrl: process.env.GOOGLE_TOKEN_URL ?? "https://oauth2.googleapis.com/token",
+  },
+  allowedEmails: (process.env.ALLOWED_EMAILS ?? "brad@automationarchitecture.ai")
+    .split(",").map((e) => e.trim().toLowerCase()).filter(Boolean),
   /** HMAC key for the admin session cookie. */
   sessionSecret: required("SESSION_SECRET"),
   /** The operator, who countersigns every contract. */
@@ -38,3 +49,8 @@ export const config = {
   maxUploadBytes: 25 * 1024 * 1024,
   linkExpiresInDays: 14,
 };
+
+export const googleEnabled = Boolean(config.google.clientId && config.google.clientSecret);
+if (!googleEnabled && !config.adminPassword) {
+  throw new Error("configure Google sign-in (GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET) or set ADMIN_PASSWORD");
+}

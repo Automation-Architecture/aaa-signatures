@@ -4,12 +4,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { createHash } from "node:crypto";
 import nodemailer from "nodemailer";
 import { PDFDocument } from "pdf-lib";
-import { config } from "./config.ts";
+import { config, googleEnabled } from "./config.ts";
+import { beginGoogleLogin, completeGoogleLogin } from "./google.ts";
 import { PgStore } from "./store.ts";
 import { buildSignedPdf } from "./pdf.ts";
 import * as pages from "./pages.ts";
 import {
-  HttpError, clientIp, userAgent, readBody, parseMultipart, parseForm, isAdmin, setSessionCookie,
+  HttpError, clientIp, userAgent, readBody, parseMultipart, parseForm, readSession, setSessionCookie,
   clearSessionCookie, constantTimeEqual, html, redirect,
 } from "./http.ts";
 import { createSignatureRequest, issueSignerToken, nextSignerToInvite } from "../request.ts";
@@ -156,8 +157,11 @@ const route = (method: string, pattern: RegExp, handler: Handler) => routes.push
 const UUID = "([0-9a-f-]{36})";
 
 function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
-  if (isAdmin(req, config.sessionSecret)) return true;
-  html(res, 200, pages.loginPage());
+  const session = readSession(req, config.sessionSecret);
+  // Re-check the allowlist on every request, so removing an address from
+  // ALLOWED_EMAILS ends that person's existing sessions too.
+  if (session && (session.email === "password" ? !googleEnabled : config.allowedEmails.includes(session.email))) return true;
+  html(res, 200, pages.loginPage({ google: googleEnabled }));
   return false;
 }
 
@@ -169,23 +173,42 @@ route("GET", /^\/$/, async (req, res, _p, url) => {
 });
 
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+route("GET", /^\/auth\/google$/, async (_req, res) => {
+  if (!googleEnabled) throw new HttpError(404, "Google sign-in is not configured");
+  redirect(res, beginGoogleLogin(res, secure));
+});
+
+route("GET", /^\/auth\/google\/callback$/, async (req, res, _p, url) => {
+  if (!googleEnabled) throw new HttpError(404, "Google sign-in is not configured");
+  const result = await completeGoogleLogin(req, url, res);
+  if (!result.ok) {
+    html(res, 403, pages.loginPage({ google: true, error: result.reason }));
+    return;
+  }
+  console.log(`[auth] signed in ${result.email}`);
+  setSessionCookie(res, config.sessionSecret, secure, result.email);
+  redirect(res, "/");
+});
+
+// Password login only exists until Google sign-in is configured.
 route("POST", /^\/login$/, async (req, res) => {
+  if (googleEnabled) throw new HttpError(404, "password sign-in is disabled");
   const ip = clientIp(req) ?? "unknown";
   const now = Date.now();
   const attempt = loginAttempts.get(ip);
   if (attempt && attempt.resetAt > now && attempt.count >= 10) {
-    html(res, 429, pages.loginPage("Too many attempts. Try again in 15 minutes."));
+    html(res, 429, pages.loginPage({ google: false, error: "Too many attempts. Try again in 15 minutes." }));
     return;
   }
   const form = parseForm(await readBody(req, 4096));
   if (constantTimeEqual(form.password ?? "", config.adminPassword)) {
     loginAttempts.delete(ip);
-    setSessionCookie(res, config.sessionSecret, secure);
+    setSessionCookie(res, config.sessionSecret, secure, "password");
     redirect(res, "/");
     return;
   }
   loginAttempts.set(ip, { count: (attempt && attempt.resetAt > now ? attempt.count : 0) + 1, resetAt: now + 15 * 60 * 1000 });
-  html(res, 401, pages.loginPage("Wrong password."));
+  html(res, 401, pages.loginPage({ google: false, error: "Wrong password." }));
 });
 
 route("POST", /^\/logout$/, async (_req, res) => {

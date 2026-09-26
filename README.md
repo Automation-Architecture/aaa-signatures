@@ -117,6 +117,14 @@ Two signers only: the client and the operator.
 - On completion the original PDF gets a signature certificate page appended (`src/server/pdf.ts`)
   and is emailed to both parties as an attachment.
 
-Environment: `DATABASE_URL`, `BASE_URL`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`,
+Admin sign-in matches the other internal AAA tools (invoices): Google sign-in on the
+workspace's Internal consent screen, with access decided by `ALLOWED_EMAILS`
+(default `brad@automationarchitecture.ai`). The Google OAuth web client's redirect URI is
+`<BASE_URL>/auth/google/callback`. Until `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are
+set, the app falls back to a single `ADMIN_PASSWORD`; once they are set, password sign-in is
+switched off. Signer links never need a login.
+
+Environment: `DATABASE_URL`, `BASE_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+`ALLOWED_EMAILS`, `ADMIN_PASSWORD` (fallback only), `SESSION_SECRET`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`,
 `EMAIL_FROM_EMAIL`, `EMAIL_FROM_NAME`, `ADMIN_SIGNER_NAME`, `ADMIN_SIGNER_EMAIL`.
 Set `EMAIL_DEV_LOG=1` locally to log emails instead of sending them. Without it, missing SMTP credentials make every send fail. Run locally with `npm run dev` (reads `.env`); `npm start` runs the compiled `dist/`.

@@ -60,11 +60,16 @@ ${opts.admin ? `<form method="post" action="/logout" style="margin:0"><button cl
 </body></html>`;
 }
 
-export function loginPage(error?: string): string {
+export function loginPage(input: { google: boolean; error?: string }): string {
+  const googleButton = `<a class="btn btn-primary" href="/auth/google" style="display:inline-flex;align-items:center;gap:10px">
+<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#010101" d="M44.5 20H24v8.5h11.8C34.7 33.9 30.1 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 4.1 29.6 2 24 2 11.8 2 2 11.8 2 24s9.8 22 22 22c11 0 21-8 21-22 0-1.3-.2-2.7-.5-4z"/></svg>
+Sign in with Google</a>
+<p class="muted" style="margin-top:16px">Use your Automation Architecture AI Google account.</p>`;
+  const passwordForm = `<form method="post" action="/login"><label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required autofocus>
+<div style="margin-top:20px"><button class="btn btn-primary">Sign in</button></div></form>`;
   return layout("Sign in", `<h1>Sign in</h1><div class="card" style="max-width:420px">
-${error ? `<div class="error">${esc(error)}</div>` : ""}
-<form method="post" action="/login"><label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required autofocus>
-<div style="margin-top:20px"><button class="btn btn-primary">Sign in</button></div></form></div>`);
+${input.error ? `<div class="error">${esc(input.error)}</div>` : ""}
+${input.google ? googleButton : passwordForm}</div>`);
 }
 
 export function adminPage(input: { requests: RequestSummary[]; adminSigner: { name: string; email: string }; notice?: string; error?: string }): string {
