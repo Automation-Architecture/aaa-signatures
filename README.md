@@ -10,7 +10,7 @@ This repo holds two things:
 | Part | Where | What it is |
 |---|---|---|
 | **Signing library** | `src/` (except `src/server/`) | `@automation-architecture/signatures`: requests, tokens, signing, audit events, signed record. No UI, no database, no email provider of its own. |
-| **AAA contract app** | `src/server/` | The site at **contract.automationarchitecture.ai**. You upload a PDF, the client signs, you countersign, and both parties get the executed PDF. |
+| **AAA contract app** | `src/server/` | The site at **contracts.automationarchitecture.ai**. You upload a PDF, the client signs, you countersign, and both parties get the executed PDF. |
 
 The library is also used outside this repo, by the Integrated Intelligence website, for podcast
 guest releases. See [Where it's used](#where-its-used).
@@ -59,7 +59,7 @@ at the end.
 
 ## Sending a contract (AAA)
 
-1. Go to **https://contract.automationarchitecture.ai** and click **Sign in with Google**. Only
+1. Go to **https://contracts.automationarchitecture.ai** and click **Sign in with Google**. Only
    `brad@automationarchitecture.ai` is allowed in.
 2. Fill in the form:
    - **Contract title:** the name the client sees in the email subject and on the certificate.
@@ -199,7 +199,7 @@ it, and the signer never types in who they are.
 | Piece | Where |
 |---|---|
 | App and database | Railway workspace `aaa_client_projects`, project `aaa-contract`: service `aaa-contract` plus a `Postgres` service |
-| Domain | Cloudflare zone `automationarchitecture.ai`: CNAME `contract` to Railway, plus a `_railway-verify.contract` TXT record |
+| Domain | `contracts.automationarchitecture.ai`: Cloudflare CNAME `contracts` to Railway, plus a `_railway-verify.contracts` TXT record. The original `contract.automationarchitecture.ai` still resolves and forwards every request there (see `REDIRECT_HOSTS`), so links emailed before the move keep working. |
 | Admin sign-in | Google OAuth web client in the same Google Cloud project as invoices, redirect `<BASE_URL>/auth/google/callback` |
 | Email | Google Workspace SMTP, signed in as `billing@automationarchitecture.ai`, sending as `contract@` (an alias) |
 | Secrets | 1Password vault `aaa-APIs`: "Google Cloud OAuth", "aaa-signatures app password", and "aaa-contract admin" (a fallback password) |
@@ -210,6 +210,7 @@ it, and the signer never types in who they are.
 |---|---|
 | `DATABASE_URL` | Postgres connection. On Railway this references the Postgres service. |
 | `BASE_URL` | Public origin used in emailed links. |
+| `REDIRECT_HOSTS` | Old hostnames that forward to `BASE_URL` with the path and query intact. Production: `contract.automationarchitecture.ai`. |
 | `SESSION_SECRET` | Signs session and OAuth-state cookies. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google sign-in. When both are set, password sign-in is off. |
 | `ALLOWED_EMAILS` | Comma-separated admin allowlist. Default `brad@automationarchitecture.ai`. |
@@ -242,7 +243,7 @@ railway up --service aaa-contract
 ```
 
 Railway builds with `npm run build` and starts with `npm start`. Afterwards, check
-`https://contract.automationarchitecture.ai/healthz` returns `ok`.
+`https://contracts.automationarchitecture.ai/healthz` returns `ok`.
 
 ### How it behaves when things go wrong
 

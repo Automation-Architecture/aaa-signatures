@@ -1,4 +1,4 @@
-// contract.automationarchitecture.ai: upload a PDF, send it to a client and the operator
+// contracts.automationarchitecture.ai: upload a PDF, send it to a client and the operator
 // for sequential signature, then deliver the executed PDF with a signature certificate.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
@@ -455,6 +455,13 @@ route("GET", /^\/healthz$/, async (_req, res) => { res.writeHead(200, { "Content
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", config.baseUrl);
+  const host = String(req.headers.host ?? "").toLowerCase().split(":")[0];
+  if (config.redirectHosts.includes(host) && url.pathname !== "/healthz") {
+    // 308 keeps the method and body, so a form posted to the old address still lands.
+    res.writeHead(308, { Location: `${config.baseUrl}${req.url ?? "/"}`, "Cache-Control": "no-store" });
+    res.end();
+    return;
+  }
   try {
     for (const r of routes) {
       if (r.method !== req.method) continue;

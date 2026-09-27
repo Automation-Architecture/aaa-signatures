@@ -1,4 +1,4 @@
-// Runtime configuration for the hosted contract-signing app (contract.automationarchitecture.ai).
+// Runtime configuration for the hosted contract-signing app (contracts.automationarchitecture.ai).
 // Every value comes from the environment; nothing is defaulted that would be wrong in production.
 
 function required(name: string): string {
@@ -9,7 +9,7 @@ function required(name: string): string {
 
 export const config = {
   port: Number(process.env.PORT ?? 3000),
-  /** Public origin used in emailed links, e.g. https://contract.automationarchitecture.ai */
+  /** Public origin used in emailed links, e.g. https://contracts.automationarchitecture.ai */
   baseUrl: (process.env.BASE_URL ?? `http://localhost:${process.env.PORT ?? 3000}`).replace(/\/$/, ""),
   databaseUrl: required("DATABASE_URL"),
   /** Single-operator admin: the upload page is behind this password. */
@@ -46,6 +46,10 @@ export const config = {
   /** Local development only: log emails instead of sending. Never set in production,
    * because the logged invite contains a live signing link. */
   emailDevLog: process.env.EMAIL_DEV_LOG === "1",
+  /** Old hostnames that should forward to BASE_URL, keeping the path and query so
+   * signing links already emailed under a previous address keep working. */
+  redirectHosts: (process.env.REDIRECT_HOSTS ?? "")
+    .split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
   maxUploadBytes: 25 * 1024 * 1024,
   linkExpiresInDays: 14,
 };
