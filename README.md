@@ -107,10 +107,11 @@ at the end.
    - **Client signer name and email:** the person's full legal name, and the address they will
      actually open.
    - **Signing order:** client first (the default), or you first.
-3. Click **Send for signature**. The client gets an email from
-   `contract@automationarchitecture.ai` with a "Review and sign" button.
-4. When the client signs, you get a "Please countersign" email. Open it, tick the consent box,
-   type your name and sign.
+3. Click **Send for signature**. Whoever signs first gets an email from
+   `contract@automationarchitecture.ai` with a "Review and sign" button. That's the client by
+   default, or you if you chose "you sign first".
+4. When the first signer finishes, the second gets a "Please countersign" email. With the default
+   order that's you. Open it, tick the consent box, type your name and sign.
 5. Both parties then get "Signed and complete" with the executed PDF attached. That PDF is your
    contract plus a signature certificate page: who signed, when, from what IP, and the
    document's SHA-256 fingerprint.
