@@ -199,7 +199,9 @@ allowBuilds:
 
 ```ts
 const { request, rawTokens } = await createSignatureRequest(store, { title, documentHtml, signers });
-// email signers[0] a link containing rawTokens.get(signer.id). Only the hash is stored.
+const first = request.signers.find((s) => s.order === 0)!;
+const firstToken = rawTokens.get(first.id)!;  // only the hash is stored; email this now
+// email `first` a link like /sign/<request.id>/<first.id>?token=<firstToken>
 
 await getSigningView(store, { requestId, signerId, token, ip, userAgent });            // GET
 const { completed, nextSigner } = await captureSignature(store, {                      // POST
