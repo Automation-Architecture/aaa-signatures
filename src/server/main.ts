@@ -74,26 +74,31 @@ async function sendInvite(request: SignatureRequest, signer: Signer, token: stri
  * existing executed PDF is reused, so its bytes and fingerprint never change. */
 async function ensureSignedPdf(requestId: string) {
   const request = await store.getRequest(requestId);
-  const doc = await store.getDocument(requestId);
+  const doc = await store.getDocumentMeta(requestId);
   if (!request || !doc) throw new Error("request or document missing at completion");
   if (request.status !== "completed") throw new Error("request is not completed");
-  if (doc.signedPdf && doc.signedSha256) return { request, doc, signedPdf: doc.signedPdf, signedSha256: doc.signedSha256 };
+  if (doc.hasSignedPdf && doc.signedSha256) {
+    const existing = await store.getPdf(requestId, "signed");
+    if (existing) return { request, doc, signedPdf: existing, signedSha256: doc.signedSha256 };
+  }
+  const originalPdf = await store.getPdf(requestId, "original");
+  if (!originalPdf) throw new Error("original PDF missing at completion");
 
   // The contract completed when the last party signed, not when this PDF happens to
   // be generated (which can be later, on a retry).
   const completedAt = request.signers.map((s) => s.signedAt).filter((v): v is string => Boolean(v)).sort().at(-1);
   if (!completedAt) throw new Error("completed request has no signing time");
   const events = await store.listAuditEvents(requestId);
-  const signedPdf = await buildSignedPdf({ originalPdf: doc.pdf, request, auditEvents: events, pdfSha256: doc.pdfSha256, completedAt });
+  const signedPdf = await buildSignedPdf({ originalPdf, request, auditEvents: events, pdfSha256: doc.pdfSha256, completedAt });
   const signedSha256 = createHash("sha256").update(signedPdf).digest("hex");
   // Only the first writer's PDF is kept. A concurrent builder loses the conditional
   // write and uses the stored copy, so every signer gets identical bytes.
   if (await store.saveSignedPdfIfAbsent(requestId, signedPdf, signedSha256, completedAt)) {
     return { request, doc, signedPdf, signedSha256 };
   }
-  const stored = await store.getDocument(requestId);
-  if (!stored?.signedPdf || !stored.signedSha256) throw new Error("executed PDF vanished after a concurrent save");
-  return { request, doc: stored, signedPdf: stored.signedPdf, signedSha256: stored.signedSha256 };
+  const [stored, storedPdf] = await Promise.all([store.getDocumentMeta(requestId), store.getPdf(requestId, "signed")]);
+  if (!stored?.signedSha256 || !storedPdf) throw new Error("executed PDF vanished after a concurrent save");
+  return { request, doc: stored, signedPdf: storedPdf, signedSha256: stored.signedSha256 };
 }
 
 type CompletionResult = { status: "busy" } | { status: "done"; failed: string[] };
@@ -301,21 +306,21 @@ route("POST", /^\/requests$/, async (req, res) => {
 route("GET", new RegExp(`^/requests/${UUID}$`), async (req, res, [id], url) => {
   if (!requireAdmin(req, res)) return;
   const request = await store.getRequest(id!);
-  const doc = await store.getDocument(id!);
+  const doc = await store.getDocumentMeta(id!);
   if (!request || !doc) throw new HttpError(404, "no such request");
   const events = await store.listAuditEvents(id!);
   const deliveries = await store.listDeliveries(id!);
   html(res, 200, pages.requestDetailPage({
-    request, events, deliveries, filename: doc.filename, pdfSha256: doc.pdfSha256, hasSigned: Boolean(doc.signedPdf),
+    request, events, deliveries, filename: doc.filename, pdfSha256: doc.pdfSha256, hasSigned: doc.hasSignedPdf,
     notice: url.searchParams.get("notice") ?? undefined, error: url.searchParams.get("error") ?? undefined,
   }));
 });
 
 route("GET", new RegExp(`^/requests/${UUID}/(original|signed)\\.pdf$`), async (req, res, [id, which]) => {
   if (!requireAdmin(req, res)) return;
-  const doc = await store.getDocument(id!);
+  const doc = await store.getDocumentMeta(id!);
   if (!doc) throw new HttpError(404, "no such request");
-  const bytes = which === "signed" ? doc.signedPdf : doc.pdf;
+  const bytes = await store.getPdf(id!, which === "signed" ? "signed" : "original");
   if (!bytes) throw new HttpError(404, "not signed yet");
   const name = which === "signed" ? doc.filename.replace(/\.pdf$/i, "") + " (signed).pdf" : doc.filename;
   res.writeHead(200, { "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename="${name.replace(/"/g, "")}"`, "Cache-Control": "no-store" });
@@ -404,10 +409,10 @@ route("GET", new RegExp(`^/sign/${UUID}/${UUID}/document\\.pdf$`), async (_req, 
     throw new HttpError(403, "this link is no longer valid");
   }
   if (nextSignerToInvite(request)?.id !== signer.id) throw new HttpError(403, "this link is no longer valid");
-  const doc = await store.getDocument(request.id);
-  if (!doc) throw new HttpError(404, "missing document");
-  res.writeHead(200, { "Content-Type": "application/pdf", "Content-Disposition": `inline; filename="${doc.filename.replace(/"/g, "")}"`, "Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN" });
-  res.end(doc.pdf);
+  const [doc, pdf] = await Promise.all([store.getDocumentMeta(request.id), store.getPdf(request.id, "original")]);
+  if (!doc || !pdf) throw new HttpError(404, "missing document");
+  res.writeHead(200, { "Content-Type": "application/pdf", "Content-Length": String(pdf.length), "Content-Disposition": `inline; filename="${doc.filename.replace(/"/g, "")}"`, "Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN" });
+  res.end(pdf);
 });
 
 route("POST", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId, signerId]) => {

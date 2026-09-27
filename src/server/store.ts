@@ -83,16 +83,6 @@ create index if not exists signature_signers_request_id_idx on signature_signers
 create index if not exists signature_audit_events_request_id_idx on signature_audit_events(request_id);
 `;
 
-export interface ContractDocument {
-  requestId: string;
-  filename: string;
-  pdf: Buffer;
-  pdfSha256: string;
-  signedPdf?: Buffer;
-  signedSha256?: string;
-  completedAt?: string;
-}
-
 export const MAX_DELIVERY_ATTEMPTS = 10;
 
 export interface Delivery {
@@ -101,6 +91,14 @@ export interface Delivery {
   attempts: number;
   lastAttemptAt?: string;
   lastError?: string;
+}
+
+export interface DocumentMeta {
+  filename: string;
+  pdfSha256: string;
+  signedSha256?: string;
+  completedAt?: string;
+  hasSignedPdf: boolean;
 }
 
 export interface RequestSummary {
@@ -252,19 +250,30 @@ export class PgStore implements SignatureStore {
     );
   }
 
-  async getDocument(requestId: string): Promise<ContractDocument | null> {
-    const { rows } = await this.pool.query("select * from contract_documents where request_id = $1", [requestId]);
+  /** Everything about a contract's files except the files themselves. PDFs can be up to
+   * 25 MB each, so pages that only show a filename or fingerprint use this. */
+  async getDocumentMeta(requestId: string): Promise<DocumentMeta | null> {
+    const { rows } = await this.pool.query(
+      `select filename, pdf_sha256, signed_sha256, completed_at, signed_pdf is not null as has_signed_pdf
+         from contract_documents where request_id = $1`,
+      [requestId],
+    );
     const r = rows[0];
     if (!r) return null;
     return {
-      requestId: r.request_id,
       filename: r.filename,
-      pdf: r.pdf,
       pdfSha256: r.pdf_sha256,
-      signedPdf: r.signed_pdf ?? undefined,
       signedSha256: r.signed_sha256 ?? undefined,
       completedAt: r.completed_at ? new Date(r.completed_at).toISOString() : undefined,
+      hasSignedPdf: r.has_signed_pdf,
     };
+  }
+
+  /** One PDF's bytes: the uploaded original or the executed copy, never both. */
+  async getPdf(requestId: string, which: "original" | "signed"): Promise<Buffer | null> {
+    const column = which === "signed" ? "signed_pdf" : "pdf";
+    const { rows } = await this.pool.query(`select ${column} as bytes from contract_documents where request_id = $1`, [requestId]);
+    return rows[0]?.bytes ?? null;
   }
 
   /** Create a pending delivery row per signer; existing rows are left alone. */
