@@ -29,49 +29,10 @@ guest releases. See [Where it's used](#where-its-used).
 
 ## Architecture
 
-The editable diagram is [`docs/architecture.excalidraw`](docs/architecture.excalidraw). Open
-it at [excalidraw.com](https://excalidraw.com) (menu, then Open) or with the Excalidraw VS Code
-extension. The same structure, rendered by GitHub:
+![How aaa-signatures is put together: the signing library feeds the AAA contract app on Railway and the Integrated Intelligence site on Netlify, each with its own database and email](docs/architecture.svg)
 
-```mermaid
-flowchart LR
-  subgraph repo["aaa-signatures repo"]
-    lib["Signing library<br/>src/ (request, sign, token,<br/>render, email, types)"]
-    app["AAA contract app<br/>src/server/"]
-    lib --> app
-  end
-
-  subgraph aaa["Automation Architecture AI"]
-    dns["Cloudflare DNS<br/>contract.automationarchitecture.ai"]
-    subgraph railway["Railway project aaa-contract"]
-      svc["Service aaa-contract<br/>Node 22"]
-      pg[("Postgres<br/>requests, signers,<br/>audit events (append-only),<br/>PDFs, deliveries")]
-    end
-    gauth["Google sign-in<br/>OAuth client, Internal"]
-    smtp["Google Workspace SMTP<br/>billing@ sending as contract@"]
-    op["1Password aaa-APIs<br/>app secrets"]
-  end
-
-  subgraph ii["Integrated Intelligence"]
-    site["integratedintelligence.fm<br/>Next.js on Netlify"]
-    turso[("Turso<br/>signature tables")]
-    brevo["Brevo<br/>transactional email"]
-  end
-
-  app -- "railway up" --> svc
-  dns --> svc
-  svc --> pg
-  svc --> gauth
-  svc --> smtp
-  op -. "copied into Railway variables" .-> svc
-  lib -- "git dependency,<br/>pinned to a commit" --> site
-  site --> turso
-  site --> brevo
-
-  brad(["Brad<br/>operator"]) -- "Google sign-in, upload" --> dns
-  client(["Client"]) -- "signing link" --> dns
-  guest(["Podcast guest"]) -- "signing link" --> site
-```
+The diagram is `docs/architecture.svg`, a plain SVG. Edit its boxes, labels and positions
+directly when the setup changes.
 
 How the pieces relate:
 
