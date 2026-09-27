@@ -274,7 +274,7 @@ export class PgStore implements SignatureStore {
          from b left join signature_signers s on s.request_id = b.id
         where ${search} and ${views[view]}
         group by b.id, b.title, b.created_at, b.status
-        order by b.created_at desc
+        order by b.created_at desc, b.id desc
         limit $${pageParams.length - 1} offset $${pageParams.length}`,
       pageParams,
     );

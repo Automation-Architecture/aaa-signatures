@@ -256,7 +256,13 @@ let cardVisible = false;
 new IntersectionObserver(([e]) => { cardVisible = e.isIntersecting; bar.classList.toggle("hidden", e.isIntersecting); updateStep(); }, { threshold: 0.15 }).observe(card);
 agree.addEventListener("change", updateStep); name.addEventListener("input", updateStep);
 
-const fail = () => { status.innerHTML = 'The document viewer could not load here. <a href="' + src + '" target="_blank" rel="noopener">Open the PDF</a> to read it, then come back to sign.'; };
+// Replaces whatever the viewer holds, so the message shows even if setup failed after
+// the loading status was already removed.
+const fail = () => {
+  const note = document.createElement("div"); note.className = "status";
+  note.innerHTML = 'The document viewer could not load here. <a href="' + src + '" target="_blank" rel="noopener">Open the PDF</a> to read it, then come back to sign.';
+  viewer.replaceChildren(note);
+};
 try {
   const pdfjs = await import(base + "/pdf.min.mjs");
   pdfjs.GlobalWorkerOptions.workerSrc = base + "/pdf.worker.min.mjs";
@@ -265,7 +271,6 @@ try {
     cMapUrl: base + "/cmaps/", cMapPacked: true, standardFontDataUrl: base + "/standard_fonts/",
     wasmUrl: base + "/wasm/", iccUrl: base + "/iccs/",
   }).promise;
-  status.remove();
   const pages = [];
   for (let n = 1; n <= pdf.numPages; n++) {
     const first = await (n === 1 ? pdf.getPage(1) : Promise.resolve(null));
@@ -275,6 +280,7 @@ try {
     holder.innerHTML = '<span class="num">' + n + " / " + pdf.numPages + "</span>";
     viewer.appendChild(holder); pages.push(holder);
   }
+  status.remove(); // only once every page placeholder is in place
   // Draw pages near the viewport and release the ones far from it, so a long contract
   // on a phone never holds more than a few page bitmaps at once. The page holder keeps
   // its aspect ratio, so releasing a canvas doesn't move the layout.
