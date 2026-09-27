@@ -30,6 +30,7 @@
   "dependencies": {
     "nodemailer": "^10.0.10",
     "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.3.289",
     "pg": "^8.23.0"
   }
 }

@@ -13,7 +13,7 @@ html{font-family:"Jura",ui-sans-serif,system-ui,sans-serif;background:var(--crea
 body{margin:0;min-height:100vh}
 header{background:var(--teal);color:var(--cream);padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px}
 header .brand{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--cream)}
-header .mark{width:28px;height:28px;border-radius:6px;background:var(--lime)}
+header .mark{width:32px;height:32px;display:block}
 header .label{font-weight:700;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase;color:var(--lime)}
 header .title{font-weight:600;text-transform:uppercase;line-height:1.1;font-size:1rem}
 header a.nav{color:var(--cream);font-size:.85rem}
@@ -45,6 +45,24 @@ td{padding:10px;border-bottom:1px solid var(--divider);vertical-align:top}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:640px){.row{grid-template-columns:1fr}.doc{height:60vh}}
 code{font-size:.8em;word-break:break-all}
+.steps{display:flex;gap:8px;list-style:none;padding:0;margin:0 0 20px;counter-reset:step}
+.steps li{flex:1;display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--divider);border-radius:6px;background:var(--white);font-weight:700;font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--body)}
+.steps li::before{counter-increment:step;content:counter(step);display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:var(--muted);color:var(--heading);font-size:.75rem;flex:none}
+.steps li.active{border-color:var(--teal);color:var(--teal)}
+.steps li.active::before{background:var(--teal);color:var(--cream)}
+.steps li.done::before{background:var(--success);color:var(--white);content:"\\2713"}
+.viewer{background:var(--muted);border:1px solid var(--divider);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:12px}
+.viewer canvas{display:block;width:100%;height:auto;background:var(--white);box-shadow:0 1px 2px rgba(0,0,0,.08);border-radius:2px}
+.viewer .page{position:relative;background:var(--white);min-height:120px}
+.viewer .page .num{position:absolute;right:8px;bottom:6px;font-size:.7rem;color:var(--body);background:rgba(255,255,255,.85);padding:1px 6px;border-radius:4px}
+.viewer .status{text-align:center;color:var(--body);font-size:.9rem;padding:24px 8px}
+.signbar{position:sticky;bottom:0;z-index:5;margin:16px -16px 0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--teal);color:var(--cream);display:flex;align-items:center;justify-content:space-between;gap:12px;transition:opacity .2s}
+.signbar.hidden{opacity:0;pointer-events:none}
+.signbar span{font-size:.85rem}
+.sign-card{scroll-margin-top:16px}
+.sign-card .btn-primary{width:100%;padding:16px}
+@media(min-width:641px){.sign-card .btn-primary{width:auto}}
+@media(max-width:640px){main{padding:20px 12px 48px}.steps li{padding:8px;font-size:.66rem;gap:6px}.steps li::before{width:20px;height:20px}h1{font-size:1.3rem}.viewer{padding:6px;gap:8px;border-radius:6px}.signbar{margin:16px -12px 0;padding-left:12px;padding-right:12px}}
 footer{text-align:center;color:var(--body);font-size:.8rem;padding:24px}
 `;
 
@@ -53,7 +71,7 @@ export function layout(title: string, body: string, opts: { admin?: boolean } = 
 <title>${esc(title)}</title><meta name="robots" content="noindex,nofollow">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Jura:wght@400;600;700&display=swap" rel="stylesheet">
 <style>${CSS}</style></head><body>
-<header><a class="brand" href="/"><span class="mark"></span><span><span class="label">Automation Architecture AI</span><br><span class="title">Contracts</span></span></a>
+<header><a class="brand" href="/"><img class="mark" src="/brand/mark.png" alt="" width="32" height="32"><span><span class="label">Automation Architecture AI</span><br><span class="title">Contracts</span></span></a>
 ${opts.admin ? `<form method="post" action="/logout" style="margin:0"><button class="btn btn-ghost" style="color:var(--cream)">Log out</button></form>` : ""}</header>
 <main>${body}</main>
 <footer>Automation Architecture AI | automationarchitecture.ai</footer>
@@ -157,25 +175,86 @@ ${request.status === "pending" ? ` <form method="post" action="/requests/${esc(r
   );
 }
 
-export function signingPage(input: { request: SignatureRequest; signer: Signer; token: string; docUrl: string; otherParty?: Signer; error?: string }): string {
+export function signingPage(input: { request: SignatureRequest; signer: Signer; token: string; docUrl: string; otherParty?: Signer; error?: string; pdfjsBase: string }): string {
   const { request, signer } = input;
+  const doc = esc(input.docUrl);
   return layout(
     `Sign: ${request.title}`,
-    `<h1>${esc(request.title)}</h1>
-<p class="muted">Prepared for <strong>${esc(signer.name)}</strong> (${esc(signer.email)})${input.otherParty ? ` · other party: ${esc(input.otherParty.name)}` : ""}. Please read the full document below, then sign at the bottom.</p>
+    `<ol class="steps" aria-label="Signing steps"><li id="step-review" class="active">Review</li><li id="step-consent">Consent</li><li id="step-sign">Sign</li></ol>
+<h1>${esc(request.title)}</h1>
+<p class="muted">Prepared for <strong>${esc(signer.name)}</strong> (${esc(signer.email)})${input.otherParty ? ` · other party: ${esc(input.otherParty.name)}` : ""}. Read the full document, then sign below it.</p>
 ${input.error ? `<div class="error">${esc(input.error)}</div>` : ""}
-<iframe class="doc" src="${esc(input.docUrl)}" title="Contract document"></iframe>
-<p class="muted">Trouble viewing? <a href="${esc(input.docUrl)}" target="_blank" rel="noopener">Open the PDF in a new tab</a>.</p>
-<div class="card"><h2 style="margin-top:0">Sign this document</h2>
+<div class="viewer" id="viewer" data-src="${doc}" data-pdfjs="${esc(input.pdfjsBase)}">
+  <div class="status" id="viewer-status">Loading the document…</div>
+</div>
+<noscript><p class="muted">Your browser has JavaScript turned off, so the document can't be shown here. <a href="${doc}" target="_blank" rel="noopener">Open the PDF</a> to read it before signing.</p></noscript>
+<p class="muted">Prefer the original file? <a href="${doc}" target="_blank" rel="noopener">Open the PDF</a>.</p>
+<div class="signbar" id="signbar"><span>Finished reading?</span><a class="btn btn-primary" href="#sign">Go to signature</a></div>
+<div class="card sign-card" id="sign"><h2 style="margin-top:0">Consent and sign</h2>
 <div class="disclosure"><strong>Consent to electronic records and signatures.</strong> By checking the box and typing your name below, you agree that you have read this document, that you intend to sign it electronically, and that your electronic signature is the legal equivalent of your handwritten signature. You agree to receive this document and the signed copy electronically at the email address above. You may request a paper copy from Automation Architecture AI at any time.</div>
 <form method="post" action="/sign/${esc(request.id)}/${esc(signer.id)}">
 <input type="hidden" name="token" value="${esc(input.token)}"><input type="hidden" name="documentSha256Seen" value="${esc(request.documentSha256)}">
-<label class="check" style="text-transform:none;letter-spacing:0;font-weight:400"><input type="checkbox" name="agree" value="yes" required><span>I agree to sign electronically and have read the document above.</span></label>
+<label class="check" style="text-transform:none;letter-spacing:0;font-weight:400"><input id="agree" type="checkbox" name="agree" value="yes" required><span>I agree to sign electronically and have read the document above.</span></label>
 <label for="name">Type your full legal name to sign</label><input id="name" type="text" name="typedLegalName" placeholder="${esc(signer.name)}" required maxlength="200" autocomplete="name">
 <p class="muted">Document fingerprint: <code>${esc(request.documentSha256)}</code></p>
-<button class="btn btn-primary">Sign document</button></form></div>`,
+<button class="btn btn-primary">Sign document</button></form></div>
+<script type="module">${VIEWER_JS}</script>`,
   );
 }
+
+// Renders the PDF page by page with PDF.js (served from this app, not a CDN), because
+// phone browsers handle an embedded PDF badly: iOS Safari shows one page, Android
+// Chrome often shows nothing. Pages are drawn only as they scroll into view, so a long
+// contract stays quick on a phone. Also drives the step bar and the sticky sign bar.
+const VIEWER_JS = `
+const viewer = document.getElementById("viewer");
+const status = document.getElementById("viewer-status");
+const src = viewer.dataset.src, base = viewer.dataset.pdfjs;
+const steps = { review: document.getElementById("step-review"), consent: document.getElementById("step-consent"), sign: document.getElementById("step-sign") };
+const setStep = (name) => {
+  const order = ["review", "consent", "sign"]; const at = order.indexOf(name);
+  order.forEach((n, i) => { steps[n].className = i < at ? "done" : i === at ? "active" : ""; });
+};
+const card = document.getElementById("sign"), bar = document.getElementById("signbar");
+const agree = document.getElementById("agree"), name = document.getElementById("name");
+const updateStep = () => setStep(agree.checked && name.value.trim() ? "sign" : agree.checked || cardVisible ? "consent" : "review");
+let cardVisible = false;
+new IntersectionObserver(([e]) => { cardVisible = e.isIntersecting; bar.classList.toggle("hidden", e.isIntersecting); updateStep(); }, { threshold: 0.15 }).observe(card);
+agree.addEventListener("change", updateStep); name.addEventListener("input", updateStep);
+
+const fail = () => { status.innerHTML = 'The document viewer could not load here. <a href="' + src + '" target="_blank" rel="noopener">Open the PDF</a> to read it, then come back to sign.'; };
+try {
+  const pdfjs = await import(base + "/pdf.min.mjs");
+  pdfjs.GlobalWorkerOptions.workerSrc = base + "/pdf.worker.min.mjs";
+  const pdf = await pdfjs.getDocument({ url: src, isEvalSupported: false }).promise;
+  status.remove();
+  const pages = [];
+  for (let n = 1; n <= pdf.numPages; n++) {
+    const first = await (n === 1 ? pdf.getPage(1) : Promise.resolve(null));
+    const holder = document.createElement("div"); holder.className = "page"; holder.dataset.n = n;
+    const ratio = first ? first.getViewport({ scale: 1 }).height / first.getViewport({ scale: 1 }).width : 1.294;
+    holder.style.aspectRatio = String(1 / ratio);
+    holder.innerHTML = '<span class="num">' + n + " / " + pdf.numPages + "</span>";
+    viewer.appendChild(holder); pages.push(holder);
+  }
+  const drawn = new Set();
+  const draw = async (holder) => {
+    const n = Number(holder.dataset.n); if (drawn.has(n)) return; drawn.add(n);
+    const page = await pdf.getPage(n);
+    const unscaled = page.getViewport({ scale: 1 });
+    holder.style.aspectRatio = String(unscaled.width / unscaled.height);
+    const scale = (holder.clientWidth / unscaled.width) * Math.min(window.devicePixelRatio || 1, 2);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(viewport.width); canvas.height = Math.floor(viewport.height);
+    canvas.setAttribute("aria-label", "Page " + n + " of " + pdf.numPages);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    holder.prepend(canvas);
+  };
+  const io = new IntersectionObserver((entries) => entries.forEach((e) => e.isIntersecting && draw(e.target)), { rootMargin: "600px 0px" });
+  pages.forEach((p) => io.observe(p));
+} catch (error) { console.error(error); fail(); }
+`;
 
 export function signedThanksPage(input: { request: SignatureRequest; completed: boolean; nextSigner?: Signer; finalized?: boolean }): string {
   return layout(

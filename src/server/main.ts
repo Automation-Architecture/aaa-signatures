@@ -18,6 +18,7 @@ import { getSigningView, captureSignature, SigningError } from "../sign.ts";
 import { verifyToken, newId } from "../token.ts";
 import { inviteEmail, completedEmail } from "./emails.ts";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import type { SignatureRequest, Signer } from "../types.ts";
 
 const store = new PgStore(config.databaseUrl);
@@ -384,7 +385,7 @@ route("GET", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId,
     const { request, signer } = await getSigningView(store, { requestId: requestId!, signerId: signerId!, token, ip: clientIp(req), userAgent: userAgent(req) });
     const otherParty = request.signers.find((s) => s.id !== signer.id);
     const docUrl = `/sign/${request.id}/${signer.id}/document.pdf?token=${encodeURIComponent(token)}`;
-    html(res, 200, pages.signingPage({ request, signer, token, docUrl, otherParty, error: url.searchParams.get("error") ?? undefined }));
+    html(res, 200, pages.signingPage({ request, signer, token, docUrl, otherParty, pdfjsBase: PDFJS_BASE, error: url.searchParams.get("error") ?? undefined }));
   } catch (error) {
     if (error instanceof SigningError) { html(res, 403, pages.messagePage("Cannot open this document", signingErrorMessage(error))); return; }
     throw error;
@@ -446,6 +447,22 @@ route("POST", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId
 });
 
 const brandMark = readFileSync(new URL("../../assets/mark.png", import.meta.url));
+
+// PDF.js for the signing page, served from this app so a client's signing page never
+// depends on a third-party CDN. The version is in the path, so it can be cached forever.
+const requireModule = createRequire(import.meta.url);
+const PDFJS_VERSION = String(requireModule("pdfjs-dist/package.json").version);
+export const PDFJS_BASE = `/vendor/pdfjs-${PDFJS_VERSION}`;
+const pdfjsFiles: Record<string, Buffer> = {
+  "pdf.min.mjs": readFileSync(requireModule.resolve("pdfjs-dist/legacy/build/pdf.min.mjs")),
+  "pdf.worker.min.mjs": readFileSync(requireModule.resolve("pdfjs-dist/legacy/build/pdf.worker.min.mjs")),
+};
+route("GET", /^\/vendor\/pdfjs-[0-9.]+\/(pdf\.min\.mjs|pdf\.worker\.min\.mjs)$/, async (_req, res, [file]) => {
+  const body = pdfjsFiles[file!];
+  if (!body) throw new HttpError(404, "not found");
+  res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=31536000, immutable" });
+  res.end(body);
+});
 route("GET", /^\/brand\/mark\.png$/, async (_req, res) => {
   res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=604800" });
   res.end(brandMark);
