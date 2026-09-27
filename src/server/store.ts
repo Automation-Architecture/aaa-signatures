@@ -257,7 +257,7 @@ export class PgStore implements SignatureStore {
       completed: "b.status = 'completed'",
       voided: "b.status = 'voided'",
     };
-    const view = input.view && views[input.view] ? input.view : "all";
+    const view: RequestView = input.view && Object.hasOwn(views, input.view) ? input.view : "all";
     const base = `with b as (
         select r.id, r.title, r.created_at, r.status, $1::text as admin_email,
                (select s.email from signature_signers s where s.request_id = r.id and s.status = 'pending' order by s."order" limit 1) as next_email

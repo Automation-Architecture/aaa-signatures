@@ -17,7 +17,8 @@ import { createSignatureRequest, issueSignerToken, nextSignerToInvite } from "..
 import { getSigningView, captureSignature, SigningError } from "../sign.ts";
 import { verifyToken, newId } from "../token.ts";
 import { inviteEmail, completedEmail } from "./emails.ts";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, extname, join } from "node:path";
 import { createRequire } from "node:module";
 import type { SignatureRequest, Signer } from "../types.ts";
 
@@ -193,7 +194,8 @@ const PAGE_SIZE = 25;
 route("GET", /^\/$/, async (req, res, _p, url) => {
   if (!requireAdmin(req, res)) return;
   const q = (url.searchParams.get("q") ?? "").slice(0, 200);
-  const page = Math.max(1, Math.floor(Number(url.searchParams.get("page")) || 1));
+  const requested = Number(url.searchParams.get("page"));
+  const page = Number.isFinite(requested) ? Math.min(100_000, Math.max(1, Math.floor(requested))) : 1;
   const list = await store.listRequests({
     q, view: (url.searchParams.get("view") ?? "all") as RequestView, adminEmail: config.adminSigner.email,
     limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE,
@@ -472,15 +474,26 @@ const brandMark = readFileSync(new URL("../../assets/mark.png", import.meta.url)
 const requireModule = createRequire(import.meta.url);
 const PDFJS_VERSION = String(requireModule("pdfjs-dist/package.json").version);
 export const PDFJS_BASE = `/vendor/pdfjs-${PDFJS_VERSION}`;
-const pdfjsFiles: Record<string, Buffer> = {
-  "pdf.min.mjs": readFileSync(requireModule.resolve("pdfjs-dist/legacy/build/pdf.min.mjs")),
-  "pdf.worker.min.mjs": readFileSync(requireModule.resolve("pdfjs-dist/legacy/build/pdf.worker.min.mjs")),
-};
-route("GET", /^\/vendor\/pdfjs-[0-9.]+\/(pdf\.min\.mjs|pdf\.worker\.min\.mjs)$/, async (_req, res, [file]) => {
-  const body = pdfjsFiles[file!];
-  if (!body) throw new HttpError(404, "not found");
-  res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=31536000, immutable" });
-  res.end(body);
+// Besides the two modules, PDF.js loads data on demand: character maps (CJK text),
+// standard font data, image decoders (wasm) and colour profiles. Without them some
+// PDFs render with missing text or not at all. Only files PDF.js ships are served:
+// the allowlist is built from its own directories at startup.
+const pdfjsRoot = dirname(requireModule.resolve("pdfjs-dist/package.json"));
+const PDFJS_TYPES: Record<string, string> = { ".mjs": "text/javascript; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".wasm": "application/wasm" };
+const pdfjsFiles = new Map<string, { body: Buffer; type: string }>();
+pdfjsFiles.set("pdf.min.mjs", { body: readFileSync(join(pdfjsRoot, "legacy/build/pdf.min.mjs")), type: PDFJS_TYPES[".mjs"]! });
+pdfjsFiles.set("pdf.worker.min.mjs", { body: readFileSync(join(pdfjsRoot, "legacy/build/pdf.worker.min.mjs")), type: PDFJS_TYPES[".mjs"]! });
+for (const dir of ["cmaps", "standard_fonts", "wasm", "iccs"]) {
+  for (const file of readdirSync(join(pdfjsRoot, dir))) {
+    if (file.startsWith("LICENSE")) continue;
+    pdfjsFiles.set(`${dir}/${file}`, { body: readFileSync(join(pdfjsRoot, dir, file)), type: PDFJS_TYPES[extname(file)] ?? "application/octet-stream" });
+  }
+}
+route("GET", /^\/vendor\/pdfjs-[0-9.]+\/(.+)$/, async (_req, res, [path]) => {
+  const file = pdfjsFiles.get(path!);
+  if (!file) throw new HttpError(404, "not found");
+  res.writeHead(200, { "Content-Type": file.type, "Content-Length": String(file.body.length), "Cache-Control": "public, max-age=31536000, immutable" });
+  res.end(file.body);
 });
 route("GET", /^\/brand\/mark\.png$/, async (_req, res) => {
   res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=604800" });

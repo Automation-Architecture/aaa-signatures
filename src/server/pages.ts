@@ -260,7 +260,11 @@ const fail = () => { status.innerHTML = 'The document viewer could not load here
 try {
   const pdfjs = await import(base + "/pdf.min.mjs");
   pdfjs.GlobalWorkerOptions.workerSrc = base + "/pdf.worker.min.mjs";
-  const pdf = await pdfjs.getDocument({ url: src, isEvalSupported: false }).promise;
+  const pdf = await pdfjs.getDocument({
+    url: src, isEvalSupported: false,
+    cMapUrl: base + "/cmaps/", cMapPacked: true, standardFontDataUrl: base + "/standard_fonts/",
+    wasmUrl: base + "/wasm/", iccUrl: base + "/iccs/",
+  }).promise;
   status.remove();
   const pages = [];
   for (let n = 1; n <= pdf.numPages; n++) {
@@ -271,22 +275,48 @@ try {
     holder.innerHTML = '<span class="num">' + n + " / " + pdf.numPages + "</span>";
     viewer.appendChild(holder); pages.push(holder);
   }
-  const drawn = new Set();
-  const draw = async (holder) => {
-    const n = Number(holder.dataset.n); if (drawn.has(n)) return; drawn.add(n);
-    const page = await pdf.getPage(n);
-    const unscaled = page.getViewport({ scale: 1 });
-    holder.style.aspectRatio = String(unscaled.width / unscaled.height);
-    const scale = (holder.clientWidth / unscaled.width) * Math.min(window.devicePixelRatio || 1, 2);
-    const viewport = page.getViewport({ scale });
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.floor(viewport.width); canvas.height = Math.floor(viewport.height);
-    canvas.setAttribute("aria-label", "Page " + n + " of " + pdf.numPages);
-    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-    holder.prepend(canvas);
+  // Draw pages near the viewport and release the ones far from it, so a long contract
+  // on a phone never holds more than a few page bitmaps at once. The page holder keeps
+  // its aspect ratio, so releasing a canvas doesn't move the layout.
+  const tasks = new Map();
+  const release = (holder) => {
+    const n = Number(holder.dataset.n);
+    tasks.get(n)?.cancel(); tasks.delete(n);
+    holder.querySelector("canvas")?.remove();
   };
-  const io = new IntersectionObserver((entries) => entries.forEach((e) => e.isIntersecting && draw(e.target)), { rootMargin: "600px 0px" });
-  pages.forEach((p) => io.observe(p));
+  const draw = async (holder) => {
+    const n = Number(holder.dataset.n);
+    if (tasks.has(n) || holder.querySelector("canvas")) return;
+    try {
+      const page = await pdf.getPage(n);
+      const unscaled = page.getViewport({ scale: 1 });
+      holder.style.aspectRatio = String(unscaled.width / unscaled.height);
+      const scale = (holder.clientWidth / unscaled.width) * Math.min(window.devicePixelRatio || 1, 2);
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.floor(viewport.width); canvas.height = Math.floor(viewport.height);
+      canvas.setAttribute("aria-label", "Page " + n + " of " + pdf.numPages);
+      const task = page.render({ canvasContext: canvas.getContext("2d"), viewport });
+      tasks.set(n, task);
+      await task.promise;
+      if (tasks.get(n) !== task) return; // released while drawing
+      tasks.delete(n);
+      holder.querySelector(".page-error")?.remove();
+      holder.prepend(canvas);
+    } catch (error) {
+      tasks.delete(n);
+      if (error && error.name === "RenderingCancelledException") return;
+      console.error(error);
+      if (!holder.querySelector(".page-error")) {
+        const note = document.createElement("div"); note.className = "status page-error";
+        note.innerHTML = 'Page ' + n + ' could not be shown here. <a href="' + src + '" target="_blank" rel="noopener">Open the PDF</a> to read it.';
+        holder.prepend(note);
+      }
+    }
+  };
+  const near = new IntersectionObserver((entries) => entries.forEach((e) => e.isIntersecting && draw(e.target)), { rootMargin: "600px 0px" });
+  const far = new IntersectionObserver((entries) => entries.forEach((e) => !e.isIntersecting && release(e.target)), { rootMargin: "2500px 0px" });
+  pages.forEach((p) => { near.observe(p); far.observe(p); });
 } catch (error) { console.error(error); fail(); }
 `;
 
