@@ -77,6 +77,13 @@ at the end.
    contract plus a signature certificate page: who signed, when, from what IP, and the
    document's SHA-256 fingerprint.
 
+The contract list has a search box (title, client name or email) and tabs with counts: All,
+Waiting on client, Waiting on you, Completed and Voided. "Waiting on you" is highlighted when
+something needs your countersignature. It shows 25 contracts per page.
+
+On the client's side, the signing page draws the contract page by page, so it reads properly on
+a phone, with numbered Review, Consent and Sign steps and a bar that jumps to the signature.
+
 Each contract's page (click its title in the list) shows:
 
 - **Signers:** status and signing time for each party.
@@ -291,6 +298,7 @@ Dependency and configuration check, done on 2026-09-27.
 | `pg` | contract app | 8.23 | 8.23 | Current. |
 | `nodemailer` | contract app | 10.0 | 10.0 | Current. |
 | `pdf-lib` | contract app | 1.17.1 | 1.17.1 | Current, but unmaintained since 2021. Fine for appending a page. |
+| `pdfjs-dist` | contract app | 6.3.289 | 6.3.289 | Draws the contract on the signing page. The legacy build is served by the app itself under a versioned path, never from a CDN. |
 | `typescript` | build | 5.9 | 7.0 | Two majors behind. Build-time only. Upgrade deliberately and rebuild. |
 | `@types/node` | build | 22 | 26 | Matches the Node 22 runtime on Railway. Keep it aligned with the runtime, not with latest. |
 
@@ -300,8 +308,8 @@ runs this library at commit `0b94586`, current as of this check. Its own package
 
 ### Should be updated
 
-1. **The library package carries the contract app's dependencies.** `pg`, `nodemailer` and
-   `pdf-lib` are listed as dependencies of `@automation-architecture/signatures`, so every
+1. **The library package carries the contract app's dependencies.** `pg`, `nodemailer`,
+   `pdf-lib` and `pdfjs-dist` are listed as dependencies of `@automation-architecture/signatures`, so every
    consumer installs them even though only `src/server/` uses them. The build also compiles
    `src/server/` into the published `dist/`. The fix is to split the app into its own package,
    for example with npm workspaces, so the library stays dependency-free.
