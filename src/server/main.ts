@@ -6,7 +6,7 @@ import nodemailer from "nodemailer";
 import { PDFDocument } from "pdf-lib";
 import { config, googleEnabled } from "./config.ts";
 import { beginGoogleLogin, completeGoogleLogin } from "./google.ts";
-import { PgStore } from "./store.ts";
+import { PgStore, type RequestView } from "./store.ts";
 import { buildSignedPdf } from "./pdf.ts";
 import * as pages from "./pages.ts";
 import {
@@ -17,7 +17,9 @@ import { createSignatureRequest, issueSignerToken, nextSignerToInvite } from "..
 import { getSigningView, captureSignature, SigningError } from "../sign.ts";
 import { verifyToken, newId } from "../token.ts";
 import { inviteEmail, completedEmail } from "./emails.ts";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, extname, join } from "node:path";
+import { createRequire } from "node:module";
 import type { SignatureRequest, Signer } from "../types.ts";
 
 const store = new PgStore(config.databaseUrl);
@@ -73,26 +75,31 @@ async function sendInvite(request: SignatureRequest, signer: Signer, token: stri
  * existing executed PDF is reused, so its bytes and fingerprint never change. */
 async function ensureSignedPdf(requestId: string) {
   const request = await store.getRequest(requestId);
-  const doc = await store.getDocument(requestId);
+  const doc = await store.getDocumentMeta(requestId);
   if (!request || !doc) throw new Error("request or document missing at completion");
   if (request.status !== "completed") throw new Error("request is not completed");
-  if (doc.signedPdf && doc.signedSha256) return { request, doc, signedPdf: doc.signedPdf, signedSha256: doc.signedSha256 };
+  if (doc.hasSignedPdf && doc.signedSha256) {
+    const existing = await store.getPdf(requestId, "signed");
+    if (existing) return { request, doc, signedPdf: existing, signedSha256: doc.signedSha256 };
+  }
+  const originalPdf = await store.getPdf(requestId, "original");
+  if (!originalPdf) throw new Error("original PDF missing at completion");
 
   // The contract completed when the last party signed, not when this PDF happens to
   // be generated (which can be later, on a retry).
   const completedAt = request.signers.map((s) => s.signedAt).filter((v): v is string => Boolean(v)).sort().at(-1);
   if (!completedAt) throw new Error("completed request has no signing time");
   const events = await store.listAuditEvents(requestId);
-  const signedPdf = await buildSignedPdf({ originalPdf: doc.pdf, request, auditEvents: events, pdfSha256: doc.pdfSha256, completedAt });
+  const signedPdf = await buildSignedPdf({ originalPdf, request, auditEvents: events, pdfSha256: doc.pdfSha256, completedAt });
   const signedSha256 = createHash("sha256").update(signedPdf).digest("hex");
   // Only the first writer's PDF is kept. A concurrent builder loses the conditional
   // write and uses the stored copy, so every signer gets identical bytes.
   if (await store.saveSignedPdfIfAbsent(requestId, signedPdf, signedSha256, completedAt)) {
     return { request, doc, signedPdf, signedSha256 };
   }
-  const stored = await store.getDocument(requestId);
-  if (!stored?.signedPdf || !stored.signedSha256) throw new Error("executed PDF vanished after a concurrent save");
-  return { request, doc: stored, signedPdf: stored.signedPdf, signedSha256: stored.signedSha256 };
+  const [stored, storedPdf] = await Promise.all([store.getDocumentMeta(requestId), store.getPdf(requestId, "signed")]);
+  if (!stored?.signedSha256 || !storedPdf) throw new Error("executed PDF vanished after a concurrent save");
+  return { request, doc: stored, signedPdf: storedPdf, signedSha256: stored.signedSha256 };
 }
 
 type CompletionResult = { status: "busy" } | { status: "done"; failed: string[] };
@@ -183,10 +190,25 @@ function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
 }
 
 // Admin: dashboard + upload
+const PAGE_SIZE = 25;
 route("GET", /^\/$/, async (req, res, _p, url) => {
   if (!requireAdmin(req, res)) return;
-  const requests = await store.listRequests();
-  html(res, 200, pages.adminPage({ requests, adminSigner: config.adminSigner, notice: url.searchParams.get("notice") ?? undefined, error: url.searchParams.get("error") ?? undefined }));
+  const q = (url.searchParams.get("q") ?? "").slice(0, 200);
+  const requested = Number(url.searchParams.get("page"));
+  const page = Number.isFinite(requested) ? Math.min(100_000, Math.max(1, Math.floor(requested))) : 1;
+  const list = await store.listRequests({
+    q, view: (url.searchParams.get("view") ?? "all") as RequestView, adminEmail: config.adminSigner.email,
+    limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE,
+  });
+  const lastPage = Math.max(1, Math.ceil(list.total / PAGE_SIZE));
+  if (page > lastPage) {
+    // An old or hand-edited link past the end: go to the last page that has results.
+    url.searchParams.set("page", String(lastPage));
+    if (lastPage === 1) url.searchParams.delete("page");
+    redirect(res, `/${url.searchParams.size ? `?${url.searchParams}` : ""}#contracts`);
+    return;
+  }
+  html(res, 200, pages.adminPage({ list, q, page, pageSize: PAGE_SIZE, adminSigner: config.adminSigner, notice: url.searchParams.get("notice") ?? undefined, error: url.searchParams.get("error") ?? undefined }));
 });
 
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -300,21 +322,21 @@ route("POST", /^\/requests$/, async (req, res) => {
 route("GET", new RegExp(`^/requests/${UUID}$`), async (req, res, [id], url) => {
   if (!requireAdmin(req, res)) return;
   const request = await store.getRequest(id!);
-  const doc = await store.getDocument(id!);
+  const doc = await store.getDocumentMeta(id!);
   if (!request || !doc) throw new HttpError(404, "no such request");
   const events = await store.listAuditEvents(id!);
   const deliveries = await store.listDeliveries(id!);
   html(res, 200, pages.requestDetailPage({
-    request, events, deliveries, filename: doc.filename, pdfSha256: doc.pdfSha256, hasSigned: Boolean(doc.signedPdf),
+    request, events, deliveries, filename: doc.filename, pdfSha256: doc.pdfSha256, hasSigned: doc.hasSignedPdf,
     notice: url.searchParams.get("notice") ?? undefined, error: url.searchParams.get("error") ?? undefined,
   }));
 });
 
 route("GET", new RegExp(`^/requests/${UUID}/(original|signed)\\.pdf$`), async (req, res, [id, which]) => {
   if (!requireAdmin(req, res)) return;
-  const doc = await store.getDocument(id!);
+  const doc = await store.getDocumentMeta(id!);
   if (!doc) throw new HttpError(404, "no such request");
-  const bytes = which === "signed" ? doc.signedPdf : doc.pdf;
+  const bytes = await store.getPdf(id!, which === "signed" ? "signed" : "original");
   if (!bytes) throw new HttpError(404, "not signed yet");
   const name = which === "signed" ? doc.filename.replace(/\.pdf$/i, "") + " (signed).pdf" : doc.filename;
   res.writeHead(200, { "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename="${name.replace(/"/g, "")}"`, "Cache-Control": "no-store" });
@@ -384,7 +406,7 @@ route("GET", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId,
     const { request, signer } = await getSigningView(store, { requestId: requestId!, signerId: signerId!, token, ip: clientIp(req), userAgent: userAgent(req) });
     const otherParty = request.signers.find((s) => s.id !== signer.id);
     const docUrl = `/sign/${request.id}/${signer.id}/document.pdf?token=${encodeURIComponent(token)}`;
-    html(res, 200, pages.signingPage({ request, signer, token, docUrl, otherParty, error: url.searchParams.get("error") ?? undefined }));
+    html(res, 200, pages.signingPage({ request, signer, token, docUrl, otherParty, pdfjsBase: PDFJS_BASE, error: url.searchParams.get("error") ?? undefined }));
   } catch (error) {
     if (error instanceof SigningError) { html(res, 403, pages.messagePage("Cannot open this document", signingErrorMessage(error))); return; }
     throw error;
@@ -403,10 +425,10 @@ route("GET", new RegExp(`^/sign/${UUID}/${UUID}/document\\.pdf$`), async (_req, 
     throw new HttpError(403, "this link is no longer valid");
   }
   if (nextSignerToInvite(request)?.id !== signer.id) throw new HttpError(403, "this link is no longer valid");
-  const doc = await store.getDocument(request.id);
-  if (!doc) throw new HttpError(404, "missing document");
-  res.writeHead(200, { "Content-Type": "application/pdf", "Content-Disposition": `inline; filename="${doc.filename.replace(/"/g, "")}"`, "Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN" });
-  res.end(doc.pdf);
+  const [doc, pdf] = await Promise.all([store.getDocumentMeta(request.id), store.getPdf(request.id, "original")]);
+  if (!doc || !pdf) throw new HttpError(404, "missing document");
+  res.writeHead(200, { "Content-Type": "application/pdf", "Content-Length": String(pdf.length), "Content-Disposition": `inline; filename="${doc.filename.replace(/"/g, "")}"`, "Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN" });
+  res.end(pdf);
 });
 
 route("POST", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId, signerId]) => {
@@ -446,6 +468,35 @@ route("POST", new RegExp(`^/sign/${UUID}/${UUID}$`), async (req, res, [requestId
 });
 
 const brandMark = readFileSync(new URL("../../assets/mark.png", import.meta.url));
+
+// PDF.js for the signing page, served from this app so a client's signing page never
+// depends on a third-party CDN. The version is in the path, so it can be cached forever.
+const requireModule = createRequire(import.meta.url);
+const PDFJS_VERSION = String(requireModule("pdfjs-dist/package.json").version);
+export const PDFJS_BASE = `/vendor/pdfjs-${PDFJS_VERSION}`;
+// Besides the two modules, PDF.js loads data on demand: character maps (CJK text),
+// standard font data, image decoders (wasm) and colour profiles. Without them some
+// PDFs render with missing text or not at all. Only files PDF.js ships are served:
+// the allowlist is built from its own directories at startup.
+const pdfjsRoot = dirname(requireModule.resolve("pdfjs-dist/package.json"));
+const PDFJS_TYPES: Record<string, string> = { ".mjs": "text/javascript; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".wasm": "application/wasm" };
+const pdfjsFiles = new Map<string, { body: Buffer; type: string }>();
+pdfjsFiles.set("pdf.min.mjs", { body: readFileSync(join(pdfjsRoot, "legacy/build/pdf.min.mjs")), type: PDFJS_TYPES[".mjs"]! });
+pdfjsFiles.set("pdf.worker.min.mjs", { body: readFileSync(join(pdfjsRoot, "legacy/build/pdf.worker.min.mjs")), type: PDFJS_TYPES[".mjs"]! });
+for (const dir of ["cmaps", "standard_fonts", "wasm", "iccs"]) {
+  for (const file of readdirSync(join(pdfjsRoot, dir))) {
+    if (file.startsWith("LICENSE")) continue;
+    pdfjsFiles.set(`${dir}/${file}`, { body: readFileSync(join(pdfjsRoot, dir, file)), type: PDFJS_TYPES[extname(file)] ?? "application/octet-stream" });
+  }
+}
+// Only the installed version answers, so a versioned URL stays a valid immutable
+// cache key across upgrades: an old page's URLs 404 instead of getting mixed files.
+route("GET", new RegExp(`^${PDFJS_BASE.replace(/[.]/g, "\\.")}/(.+)$`), async (_req, res, [path]) => {
+  const file = pdfjsFiles.get(path!);
+  if (!file) throw new HttpError(404, "not found");
+  res.writeHead(200, { "Content-Type": file.type, "Content-Length": String(file.body.length), "Cache-Control": "public, max-age=31536000, immutable" });
+  res.end(file.body);
+});
 route("GET", /^\/brand\/mark\.png$/, async (_req, res) => {
   res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=604800" });
   res.end(brandMark);
