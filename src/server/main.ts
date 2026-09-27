@@ -489,7 +489,9 @@ for (const dir of ["cmaps", "standard_fonts", "wasm", "iccs"]) {
     pdfjsFiles.set(`${dir}/${file}`, { body: readFileSync(join(pdfjsRoot, dir, file)), type: PDFJS_TYPES[extname(file)] ?? "application/octet-stream" });
   }
 }
-route("GET", /^\/vendor\/pdfjs-[0-9.]+\/(.+)$/, async (_req, res, [path]) => {
+// Only the installed version answers, so a versioned URL stays a valid immutable
+// cache key across upgrades: an old page's URLs 404 instead of getting mixed files.
+route("GET", new RegExp(`^${PDFJS_BASE.replace(/[.]/g, "\\.")}/(.+)$`), async (_req, res, [path]) => {
   const file = pdfjsFiles.get(path!);
   if (!file) throw new HttpError(404, "not found");
   res.writeHead(200, { "Content-Type": file.type, "Content-Length": String(file.body.length), "Cache-Control": "public, max-age=31536000, immutable" });

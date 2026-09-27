@@ -278,21 +278,25 @@ try {
   // Draw pages near the viewport and release the ones far from it, so a long contract
   // on a phone never holds more than a few page bitmaps at once. The page holder keeps
   // its aspect ratio, so releasing a canvas doesn't move the layout.
-  const tasks = new Map();
+  // Each draw gets a ticket before its first await. release() voids the ticket and
+  // cancels any render in progress, so a draw that was overtaken (the page scrolled
+  // away mid-fetch, or a newer draw started) gives up instead of adding a canvas
+  // off-screen, and never touches a newer draw's state.
+  const tickets = new Map(); // page number -> { task }
   const release = (holder) => {
     const n = Number(holder.dataset.n);
-    tasks.get(n)?.cancel(); tasks.delete(n);
+    tickets.get(n)?.task?.cancel(); tickets.delete(n);
     holder.querySelector("canvas")?.remove();
   };
   const draw = async (holder) => {
     const n = Number(holder.dataset.n);
-    if (tasks.has(n) || holder.querySelector("canvas")) return;
-    let task = null;
-    // Only ever clear this call's own entry: after a release, a newer draw for the same
-    // page may already have registered its task, and it must not be dropped.
-    const forget = () => { if (tasks.get(n) === task) tasks.delete(n); };
+    if (tickets.has(n) || holder.querySelector("canvas")) return;
+    const ticket = { task: null };
+    tickets.set(n, ticket);
+    const current = () => tickets.get(n) === ticket;
     try {
       const page = await pdf.getPage(n);
+      if (!current()) return;
       const unscaled = page.getViewport({ scale: 1 });
       holder.style.aspectRatio = String(unscaled.width / unscaled.height);
       const scale = (holder.clientWidth / unscaled.width) * Math.min(window.devicePixelRatio || 1, 2);
@@ -300,15 +304,15 @@ try {
       const canvas = document.createElement("canvas");
       canvas.width = Math.floor(viewport.width); canvas.height = Math.floor(viewport.height);
       canvas.setAttribute("aria-label", "Page " + n + " of " + pdf.numPages);
-      task = page.render({ canvasContext: canvas.getContext("2d"), viewport });
-      tasks.set(n, task);
-      await task.promise;
-      if (tasks.get(n) !== task) return; // released while drawing
-      forget();
+      ticket.task = page.render({ canvasContext: canvas.getContext("2d"), viewport });
+      await ticket.task.promise;
+      if (!current()) return;
+      tickets.delete(n);
       holder.querySelector(".page-error")?.remove();
       holder.prepend(canvas);
     } catch (error) {
-      forget();
+      if (!current()) return; // released or superseded; nothing to report
+      tickets.delete(n);
       if (error && error.name === "RenderingCancelledException") return;
       console.error(error);
       if (!holder.querySelector(".page-error")) {
