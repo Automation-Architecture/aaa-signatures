@@ -6,7 +6,7 @@ import nodemailer from "nodemailer";
 import { PDFDocument } from "pdf-lib";
 import { config, googleEnabled } from "./config.ts";
 import { beginGoogleLogin, completeGoogleLogin } from "./google.ts";
-import { PgStore } from "./store.ts";
+import { PgStore, type RequestView } from "./store.ts";
 import { buildSignedPdf } from "./pdf.ts";
 import * as pages from "./pages.ts";
 import {
@@ -189,10 +189,24 @@ function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
 }
 
 // Admin: dashboard + upload
+const PAGE_SIZE = 25;
 route("GET", /^\/$/, async (req, res, _p, url) => {
   if (!requireAdmin(req, res)) return;
-  const requests = await store.listRequests();
-  html(res, 200, pages.adminPage({ requests, adminSigner: config.adminSigner, notice: url.searchParams.get("notice") ?? undefined, error: url.searchParams.get("error") ?? undefined }));
+  const q = (url.searchParams.get("q") ?? "").slice(0, 200);
+  const page = Math.max(1, Math.floor(Number(url.searchParams.get("page")) || 1));
+  const list = await store.listRequests({
+    q, view: (url.searchParams.get("view") ?? "all") as RequestView, adminEmail: config.adminSigner.email,
+    limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE,
+  });
+  const lastPage = Math.max(1, Math.ceil(list.total / PAGE_SIZE));
+  if (page > lastPage) {
+    // An old or hand-edited link past the end: go to the last page that has results.
+    url.searchParams.set("page", String(lastPage));
+    if (lastPage === 1) url.searchParams.delete("page");
+    redirect(res, `/${url.searchParams.size ? `?${url.searchParams}` : ""}#contracts`);
+    return;
+  }
+  html(res, 200, pages.adminPage({ list, q, page, pageSize: PAGE_SIZE, adminSigner: config.adminSigner, notice: url.searchParams.get("notice") ?? undefined, error: url.searchParams.get("error") ?? undefined }));
 });
 
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();

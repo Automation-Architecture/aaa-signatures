@@ -79,6 +79,7 @@ create trigger signature_audit_events_no_truncate
   before truncate on signature_audit_events
   for each statement execute function signature_audit_events_append_only();
 
+create index if not exists signature_requests_created_at_idx on signature_requests(created_at desc);
 create index if not exists signature_signers_request_id_idx on signature_signers(request_id);
 create index if not exists signature_audit_events_request_id_idx on signature_audit_events(request_id);
 `;
@@ -99,6 +100,15 @@ export interface DocumentMeta {
   signedSha256?: string;
   completedAt?: string;
   hasSignedPdf: boolean;
+}
+
+export type RequestView = "all" | "waiting_client" | "waiting_me" | "completed" | "voided";
+
+export interface RequestPage {
+  rows: RequestSummary[];
+  total: number;
+  counts: Record<RequestView, number>;
+  view: RequestView;
 }
 
 export interface RequestSummary {
@@ -227,20 +237,53 @@ export class PgStore implements SignatureStore {
     }));
   }
 
-  async listRequests(): Promise<RequestSummary[]> {
+  /**
+   * One page of the contract list, newest first, with optional search and a status view.
+   * "Waiting on you" / "waiting on client" come from who the next pending signer is.
+   * Also returns the count for every view (under the same search) for the tabs.
+   */
+  async listRequests(input: { q?: string; view?: RequestView; adminEmail: string; limit: number; offset: number }): Promise<RequestPage> {
+    const params: unknown[] = [input.adminEmail.toLowerCase()];
+    let search = "true";
+    if (input.q?.trim()) {
+      params.push(`%${input.q.trim().replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+      const p = `$${params.length}`;
+      search = `(b.title ilike ${p} or exists (select 1 from signature_signers s2 where s2.request_id = b.id and (s2.name ilike ${p} or s2.email ilike ${p})))`;
+    }
+    const views: Record<RequestView, string> = {
+      all: "true",
+      waiting_client: "b.status = 'pending' and b.next_email is not null and lower(b.next_email) <> b.admin_email",
+      waiting_me: "b.status = 'pending' and lower(b.next_email) = b.admin_email",
+      completed: "b.status = 'completed'",
+      voided: "b.status = 'voided'",
+    };
+    const view = input.view && views[input.view] ? input.view : "all";
+    const base = `with b as (
+        select r.id, r.title, r.created_at, r.status, $1::text as admin_email,
+               (select s.email from signature_signers s where s.request_id = r.id and s.status = 'pending' order by s."order" limit 1) as next_email
+          from signature_requests r)`;
+
+    const countsSql = `${base} select ${Object.entries(views).map(([k, cond]) => `count(*) filter (where ${cond})::int as ${k}`).join(", ")} from b where ${search}`;
+    const counts = (await this.pool.query(countsSql, params)).rows[0] as Record<RequestView, number>;
+
+    const pageParams = [...params, input.limit, input.offset];
     const { rows } = await this.pool.query(
-      `select r.id, r.title, r.created_at, r.status,
+      `${base}
+       select b.id, b.title, b.created_at, b.status,
               coalesce(json_agg(json_build_object('name', s.name, 'email', s.email, 'order', s."order", 'status', s.status, 'signedAt', s.signed_at) order by s."order") filter (where s.id is not null), '[]') as signers
-         from signature_requests r left join signature_signers s on s.request_id = r.id
-        group by r.id order by r.created_at desc limit 200`,
+         from b left join signature_signers s on s.request_id = b.id
+        where ${search} and ${views[view]}
+        group by b.id, b.title, b.created_at, b.status
+        order by b.created_at desc
+        limit $${pageParams.length - 1} offset $${pageParams.length}`,
+      pageParams,
     );
-    return rows.map((r) => ({
-      id: r.id,
-      title: r.title,
-      createdAt: new Date(r.created_at).toISOString(),
-      status: r.status,
-      signers: r.signers,
-    }));
+    return {
+      rows: rows.map((r) => ({ id: r.id, title: r.title, createdAt: new Date(r.created_at).toISOString(), status: r.status, signers: r.signers })),
+      total: counts[view],
+      counts,
+      view,
+    };
   }
 
   async saveDocument(doc: { requestId: string; filename: string; pdf: Buffer; pdfSha256: string }): Promise<void> {

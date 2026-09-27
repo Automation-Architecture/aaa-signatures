@@ -1,6 +1,6 @@
 // Server-rendered pages. Brand: Automation-Architecture/aaa-brand DESIGN.md (Jura, teal, lime accent).
 import type { AuditEvent, SignatureRequest, Signer } from "../types.ts";
-import { MAX_DELIVERY_ATTEMPTS, type Delivery, type RequestSummary } from "./store.ts";
+import { MAX_DELIVERY_ATTEMPTS, type Delivery, type RequestPage, type RequestView } from "./store.ts";
 
 export function esc(value: unknown): string {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -11,6 +11,7 @@ const CSS = `
 *{box-sizing:border-box}
 html{font-family:"Jura",ui-sans-serif,system-ui,sans-serif;background:var(--cream);color:var(--heading);line-height:1.6}
 body{margin:0;min-height:100vh}
+a{color:var(--teal)}a:hover{text-decoration-thickness:2px}
 header{background:var(--teal);color:var(--cream);padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px}
 header .brand{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--cream)}
 header .mark{width:32px;height:32px;display:block}
@@ -45,6 +46,13 @@ td{padding:10px;border-bottom:1px solid var(--divider);vertical-align:top}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:640px){.row{grid-template-columns:1fr}.doc{height:60vh}}
 code{font-size:.8em;word-break:break-all}
+.search{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}.search input{flex:1 1 220px;min-width:0;padding:11px 12px;border:1px solid var(--divider);border-radius:6px;font:inherit;background:var(--white)}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.tab{padding:7px 12px;border:1px solid var(--divider);border-radius:6px;background:var(--white);color:var(--heading);text-decoration:none;font-weight:700;font-size:.72rem;letter-spacing:.06em;text-transform:uppercase}
+.tab .count{display:inline-block;min-width:20px;padding:0 6px;margin-left:4px;border-radius:10px;background:var(--muted);text-align:center}
+.tab.active{background:var(--teal);border-color:var(--teal);color:var(--white)}.tab.active .count{background:rgba(255,255,255,.2)}
+.tab.attention:not(.active) .count{background:var(--lime);color:var(--black)}
+.pager{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:-8px}
 .steps{display:flex;gap:8px;list-style:none;padding:0;margin:0 0 20px;counter-reset:step}
 .steps li{flex:1;display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--divider);border-radius:6px;background:var(--white);font-weight:700;font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--body)}
 .steps li::before{counter-increment:step;content:counter(step);display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:var(--muted);color:var(--heading);font-size:.75rem;flex:none}
@@ -90,8 +98,30 @@ ${input.error ? `<div class="error">${esc(input.error)}</div>` : ""}
 ${input.google ? googleButton : passwordForm}</div>`);
 }
 
-export function adminPage(input: { requests: RequestSummary[]; adminSigner: { name: string; email: string }; notice?: string; error?: string }): string {
-  const rows = input.requests
+const VIEW_LABELS: [RequestView, string][] = [
+  ["all", "All"], ["waiting_client", "Waiting on client"], ["waiting_me", "Waiting on you"], ["completed", "Completed"], ["voided", "Voided"],
+];
+
+export function adminPage(input: { list: RequestPage; q: string; page: number; pageSize: number; adminSigner: { name: string; email: string }; notice?: string; error?: string }): string {
+  const { list } = input;
+  const link = (view: RequestView, page = 1) => {
+    const params = new URLSearchParams();
+    if (input.q) params.set("q", input.q);
+    if (view !== "all") params.set("view", view);
+    if (page > 1) params.set("page", String(page));
+    const qs = params.toString();
+    return `/${qs ? `?${qs}` : ""}#contracts`;
+  };
+  const tabs = VIEW_LABELS.map(([view, label]) =>
+    `<a class="tab${list.view === view ? " active" : ""}${view === "waiting_me" && list.counts.waiting_me > 0 ? " attention" : ""}" href="${esc(link(view))}">${esc(label)} <span class="count">${list.counts[view] ?? 0}</span></a>`,
+  ).join("");
+  const first = list.total === 0 ? 0 : (input.page - 1) * input.pageSize + 1;
+  const last = Math.min(input.page * input.pageSize, list.total);
+  const pager = list.total > input.pageSize
+    ? `<div class="pager"><span class="muted">${first} to ${last} of ${list.total}</span><span>${input.page > 1 ? `<a class="btn btn-ghost" href="${esc(link(list.view, input.page - 1))}">Newer</a>` : ""} ${last < list.total ? `<a class="btn btn-ghost" href="${esc(link(list.view, input.page + 1))}">Older</a>` : ""}</span></div>`
+    : "";
+  const empty = input.q || list.view !== "all" ? "No contracts match." : "Nothing sent yet.";
+  const rows = list.rows
     .map((r) => {
       const client = r.signers.find((s) => s.email !== input.adminSigner.email) ?? r.signers[0];
       const progress = r.signers.map((s) => `<span class="pill ${esc(s.status)}">${esc(s.name.split(" ")[0])}: ${esc(s.status)}</span>`).join(" ");
@@ -114,9 +144,13 @@ export function adminPage(input: { requests: RequestSummary[]; adminSigner: { na
 <option value="me_first">${esc(input.adminSigner.name)} signs first, then the client</option></select>
 <p class="muted">You countersign as ${esc(input.adminSigner.name)} (${esc(input.adminSigner.email)}). Each signer gets a single-use link by email that expires in 14 days. Once both have signed, both receive the executed PDF with a signature certificate.</p>
 <button class="btn btn-primary">Send for signature</button></form></div>
-<h2>Contracts</h2>
+<h2 id="contracts">Contracts</h2>
+<form class="search" method="get" action="/#contracts">${list.view !== "all" ? `<input type="hidden" name="view" value="${esc(list.view)}">` : ""}
+<input type="search" name="q" value="${esc(input.q)}" placeholder="Search by title, client name or email" aria-label="Search contracts"><button class="btn btn-secondary">Search</button>${input.q ? ` <a class="btn btn-ghost" href="${esc(list.view === "all" ? "/#contracts" : `/?view=${list.view}#contracts`)}">Clear</a>` : ""}</form>
+<nav class="tabs" aria-label="Filter contracts">${tabs}</nav>
 <div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>Contract</th><th>Sent</th><th>Status</th><th>Signers</th></tr></thead>
-<tbody>${rows || `<tr><td colspan="4" class="muted">Nothing sent yet.</td></tr>`}</tbody></table></div>`,
+<tbody>${rows || `<tr><td colspan="4" class="muted">${empty}</td></tr>`}</tbody></table></div>
+${pager}`,
     { admin: true },
   );
 }
