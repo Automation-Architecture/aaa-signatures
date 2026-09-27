@@ -287,6 +287,10 @@ try {
   const draw = async (holder) => {
     const n = Number(holder.dataset.n);
     if (tasks.has(n) || holder.querySelector("canvas")) return;
+    let task = null;
+    // Only ever clear this call's own entry: after a release, a newer draw for the same
+    // page may already have registered its task, and it must not be dropped.
+    const forget = () => { if (tasks.get(n) === task) tasks.delete(n); };
     try {
       const page = await pdf.getPage(n);
       const unscaled = page.getViewport({ scale: 1 });
@@ -296,15 +300,15 @@ try {
       const canvas = document.createElement("canvas");
       canvas.width = Math.floor(viewport.width); canvas.height = Math.floor(viewport.height);
       canvas.setAttribute("aria-label", "Page " + n + " of " + pdf.numPages);
-      const task = page.render({ canvasContext: canvas.getContext("2d"), viewport });
+      task = page.render({ canvasContext: canvas.getContext("2d"), viewport });
       tasks.set(n, task);
       await task.promise;
       if (tasks.get(n) !== task) return; // released while drawing
-      tasks.delete(n);
+      forget();
       holder.querySelector(".page-error")?.remove();
       holder.prepend(canvas);
     } catch (error) {
-      tasks.delete(n);
+      forget();
       if (error && error.name === "RenderingCancelledException") return;
       console.error(error);
       if (!holder.querySelector(".page-error")) {
