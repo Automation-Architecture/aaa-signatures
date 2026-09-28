@@ -351,10 +351,12 @@ runs this library at commit `0b94586`, current as of this check. Its own package
    for example with npm workspaces, so the library stays dependency-free.
 2. **Deploys are manual.** Nothing stops `main` and production from drifting apart. Connect the
    Railway service to this repo so merges to `main` deploy, or add a deploy step to CI.
-3. **No CI runs the tests.** `npm test` only runs locally. Add a GitHub Actions workflow that
-   runs `npm ci`, `npm run build` and `npm test` on every PR. The contract app's automated tests
-   cover only upload validation and the API key check; its database paths and failure
-   handling were verified by hand (the API end to end against a local Postgres, 2026-09-28).
+3. **CI runs build and tests, but isn't a required check yet.** `.github/workflows/ci.yml`
+   runs `npm ci`, `npm run build` (the type check) and `npm test` on every PR and push to
+   `main`. Make it a required status check in the branch ruleset so a red run blocks the merge.
+   The contract app's automated tests cover only upload validation, the API key check and
+   idempotent request storage; its other database paths and failure handling were verified by
+   hand.
 4. **Integrated Intelligence doesn't retry completion emails.** If Brevo fails when the last
    party signs, the signature is recorded, the request errors and nobody is told. The contract
    app solved this with tracked, retried deliveries. That logic lives in `src/server/`, not the
@@ -379,6 +381,9 @@ runs this library at commit `0b94586`, current as of this check. Its own package
 ```bash
 npm test
 ```
+
+CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run build` and `npm test` on every pull
+request and push to `main`.
 
 The library tests cover:
 
