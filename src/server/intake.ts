@@ -17,6 +17,10 @@ export interface ContractUpload {
   pageCount: number;
 }
 
+/** The admin form's maxlength limits, enforced here too because the API has no form.
+ * Title and names end up in email subjects and bodies, so they must stay small. */
+export const FIELD_LIMITS = { title: 200, clientName: 120, clientEmail: 200 } as const;
+
 export type IntakeResult = { ok: true; upload: ContractUpload } | { ok: false; error: string };
 
 export function formField(parts: FormPart[], name: string): string {
@@ -32,6 +36,10 @@ export async function validateContractUpload(parts: FormPart[]): Promise<IntakeR
 
   if (!title || !clientName || !clientEmail || !file || file.data.length === 0) {
     return { ok: false, error: "Title, client name, client email and a PDF are all required." };
+  }
+  for (const [name, max] of Object.entries(FIELD_LIMITS)) {
+    const length = { title, clientName, clientEmail }[name as keyof typeof FIELD_LIMITS].length;
+    if (length > max) return { ok: false, error: `${name} is too long (${length} characters, the limit is ${max}).` };
   }
   if (orderField && orderField !== "client_first" && orderField !== "me_first") {
     return { ok: false, error: 'Signing order must be "client_first" or "me_first".' };

@@ -58,3 +58,10 @@ test("bearer key must match exactly, and an unset key never matches", () => {
   assert.equal(bearerTokenMatches({ headers: { authorization: "Bearer " } }, ""), false);
   assert.equal(bearerTokenMatches({ headers: { authorization: "Bearer anything" } }, ""), false);
 });
+
+test("fields longer than the admin form allows are refused", async () => {
+  assert.equal((await validateContractUpload(await upload({ title: "t".repeat(201) }))).ok, false);
+  assert.equal((await validateContractUpload(await upload({ clientName: "n".repeat(121) }))).ok, false);
+  assert.equal((await validateContractUpload(await upload({ clientEmail: `${"a".repeat(195)}@b.co` }))).ok, false);
+  assert.equal((await validateContractUpload(await upload({ title: "t".repeat(200) }))).ok, true);
+});
