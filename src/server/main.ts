@@ -586,11 +586,17 @@ route("POST", /^\/api\/requests$/, async (req, res) => {
     const signers = [...existing.signers].sort((a, b) => a.order - b.order).map((s) => ({ name: s.name, email: s.email }));
     const storedCountersigner = order === "me_first" ? signers[0]! : signers[1]!;
     const storedClient = order === "me_first" ? signers[1]! : signers[0]!;
+    // The original call's response may have been lost, so report the invite outcome from
+    // what was persisted: sendInvite records a "sent" event only after the email went out.
+    const first = [...existing.signers].sort((a, b) => a.order - b.order)[0]!;
+    const inviteSent = (await store.listAuditEvents(id)).some((e) => e.type === "sent" && e.signerId === first.id);
     return {
       id, status: existing.status, adminUrl: adminUrl(id),
       title: existing.title, filename: doc.filename, pdfSha256: doc.pdfSha256, pageCount: u.pageCount, order,
       client: storedClient, countersigner: storedCountersigner, firstSigner: signers[0]!,
-      duplicate: true, inviteSent: null, inviteError: null, warning: null,
+      duplicate: true, inviteSent,
+      inviteError: inviteSent ? null : `no invite is recorded as sent to ${first.email}; use "Resend link" on the contract page`,
+      warning: null,
     };
   };
   const existingId = u.idempotencyKey ? await store.findPendingByIdempotencyKey(u.idempotencyKey) : null;
