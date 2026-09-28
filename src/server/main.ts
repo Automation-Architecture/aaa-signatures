@@ -283,7 +283,10 @@ async function createAndSend(upload: ContractUpload, via: "web" | "api", req: In
 
   const { request, rawTokens } = await createSignatureRequest(store, {
     title: upload.title, documentHtml, signers, expiresInDays: config.linkExpiresInDays,
-    metadata: { filename: upload.filename, pdfSha256: upload.pdfSha256, order: upload.order, createdVia: via },
+    metadata: {
+      filename: upload.filename, pdfSha256: upload.pdfSha256, order: upload.order, createdVia: via,
+      ...(upload.idempotencyKey ? { idempotencyKey: upload.idempotencyKey } : {}),
+    },
   });
   await store.saveDocument({ requestId: request.id, filename: upload.filename, pdf: upload.pdf, pdfSha256: upload.pdfSha256 });
 
@@ -558,15 +561,39 @@ route("POST", /^\/api\/requests$/, async (req, res) => {
     title: u.title, filename: u.filename, pdfSha256: u.pdfSha256, pageCount: u.pageCount, order: u.order,
     client, countersigner: config.adminSigner, firstSigner,
   };
+  // A retry of a send that already went through (same key, still pending) returns that
+  // contract instead of creating and emailing a second one.
+  const existingResponse = async (id: string) => {
+    const [existing, doc] = await Promise.all([store.getRequest(id), store.getDocumentMeta(id)]);
+    if (!existing || !doc) throw new HttpError(500, "idempotency key points at a missing request");
+    if (doc.pdfSha256 !== u.pdfSha256) throw new HttpError(409, "this idempotencyKey was already used for a different PDF");
+    return { id, status: existing.status, adminUrl: adminUrl(id), ...summary, duplicate: true, inviteSent: null, inviteError: null, warning: null };
+  };
+  const existingId = u.idempotencyKey ? await store.findPendingByIdempotencyKey(u.idempotencyKey) : null;
   if (formField(parts, "dryRun") === "1") {
-    json(res, 200, { dryRun: true, ...summary });
+    json(res, 200, { dryRun: true, ...summary, alreadySent: existingId ? { id: existingId, adminUrl: adminUrl(existingId) } : null });
     return;
   }
-  const { request, first, inviteError, auditWarning } = await createAndSend(u, "api", req);
+  if (existingId) {
+    json(res, 200, await existingResponse(existingId));
+    return;
+  }
+  let created: Awaited<ReturnType<typeof createAndSend>>;
+  try {
+    created = await createAndSend(u, "api", req);
+  } catch (error) {
+    // Two identical sends racing: the unique index lets one in; the other returns it.
+    const raced = u.idempotencyKey && (error as { code?: string }).code === "23505"
+      ? await store.findPendingByIdempotencyKey(u.idempotencyKey) : null;
+    if (!raced) throw error;
+    json(res, 200, await existingResponse(raced));
+    return;
+  }
+  const { request, first, inviteError, auditWarning } = created;
   console.log(`[api] created request ${request.id} "${u.title}", invite to ${first.email}${inviteError ? " FAILED" : ""}`);
   json(res, 201, {
     id: request.id, status: request.status, adminUrl: adminUrl(request.id), ...summary,
-    inviteSent: !inviteError, inviteError: inviteError ?? null, warning: auditWarning ?? null,
+    duplicate: false, inviteSent: !inviteError, inviteError: inviteError ?? null, warning: auditWarning ?? null,
   });
 });
 

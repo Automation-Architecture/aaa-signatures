@@ -120,6 +120,7 @@ key".
 |---|---|
 | `POST /api/requests` | Multipart, the same fields as the admin form: `title`, `clientName`, `clientEmail`, `order` (`client_first` or `me_first`) and `pdf`. Creates the request and emails the first signer. Returns `201` with the id, contract page URL, fingerprint and whether the invite went out. |
 | `POST /api/requests` with `dryRun=1` | Validates the upload and returns what would be sent (signers, page count, fingerprint). Stores and sends nothing. |
+| `idempotencyKey` field (optional) | 16 to 128 letters, digits, `-` or `_`. While a request created with that key is pending, a repeat `POST` returns it (`duplicate: true`) instead of creating and emailing a second one, so a retry after a dropped connection is safe. A different PDF under the same key gets `409`. Voiding or completing the request frees the key. A dry run reports `alreadySent`. |
 | `GET /api/requests` | The contract list: `q` (search), `view` (`all`, `waiting_client`, `waiting_me`, `completed`, `voided`), `limit` (up to 100), `offset`. |
 | `GET /api/requests/<id>` | One contract: signers, audit trail, who it's waiting on (none once voided or completed), and each executed-PDF delivery with its `state` (`pending`, `retrying`, `failed`, `delivered`), attempts and last error. |
 

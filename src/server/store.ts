@@ -80,6 +80,12 @@ create trigger signature_audit_events_no_truncate
   for each statement execute function signature_audit_events_append_only();
 
 create index if not exists signature_requests_created_at_idx on signature_requests(created_at desc);
+-- At most one pending request per API idempotency key, so a retried send after a dropped
+-- connection returns the contract already sent instead of emailing a second one. Voiding
+-- or completing the request frees the key.
+create unique index if not exists signature_requests_pending_idempotency_key
+  on signature_requests ((metadata->>'idempotencyKey'))
+  where status = 'pending' and metadata ? 'idempotencyKey';
 create index if not exists signature_signers_request_id_idx on signature_signers(request_id);
 create index if not exists signature_audit_events_request_id_idx on signature_audit_events(request_id);
 `;
@@ -169,6 +175,15 @@ export class PgStore implements SignatureStore {
     } finally {
       client.release();
     }
+  }
+
+  /** The pending request created with this API idempotency key, if any. */
+  async findPendingByIdempotencyKey(key: string): Promise<string | null> {
+    const { rows } = await this.pool.query(
+      "select id from signature_requests where status = 'pending' and metadata->>'idempotencyKey' = $1 limit 1",
+      [key],
+    );
+    return rows[0]?.id ?? null;
   }
 
   async getRequest(id: string): Promise<SignatureRequest | null> {

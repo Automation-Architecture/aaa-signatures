@@ -15,6 +15,8 @@ export interface ContractUpload {
   pdf: Buffer;
   pdfSha256: string;
   pageCount: number;
+  /** API only: identifies one approved send, so a retry can't create a second request. */
+  idempotencyKey?: string;
 }
 
 /** The admin form's maxlength limits, enforced here too because the API has no form.
@@ -40,6 +42,10 @@ export async function validateContractUpload(parts: FormPart[]): Promise<IntakeR
   for (const [name, max] of Object.entries(FIELD_LIMITS)) {
     const length = { title, clientName, clientEmail }[name as keyof typeof FIELD_LIMITS].length;
     if (length > max) return { ok: false, error: `${name} is too long (${length} characters, the limit is ${max}).` };
+  }
+  const idempotencyKey = formField(parts, "idempotencyKey");
+  if (idempotencyKey && !/^[A-Za-z0-9_-]{16,128}$/.test(idempotencyKey)) {
+    return { ok: false, error: "idempotencyKey must be 16 to 128 letters, digits, hyphens or underscores." };
   }
   if (orderField && orderField !== "client_first" && orderField !== "me_first") {
     return { ok: false, error: 'Signing order must be "client_first" or "me_first".' };
@@ -73,6 +79,7 @@ export async function validateContractUpload(parts: FormPart[]): Promise<IntakeR
       pdf: file.data,
       pdfSha256: createHash("sha256").update(file.data).digest("hex"),
       pageCount,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
     },
   };
 }

@@ -65,3 +65,12 @@ test("fields longer than the admin form allows are refused", async () => {
   assert.equal((await validateContractUpload(await upload({ clientEmail: `${"a".repeat(196)}@b.co` }))).ok, false);
   assert.equal((await validateContractUpload(await upload({ title: "t".repeat(200) }))).ok, true);
 });
+
+test("an idempotency key is optional and must be a plain token", async () => {
+  const good = await validateContractUpload(await upload({ idempotencyKey: "a".repeat(64) }));
+  assert.equal(good.ok && good.upload.idempotencyKey, "a".repeat(64));
+  assert.equal((await validateContractUpload(await upload({ idempotencyKey: "short" }))).ok, false);
+  assert.equal((await validateContractUpload(await upload({ idempotencyKey: "has spaces in it, sixteen+" }))).ok, false);
+  const none = await validateContractUpload(await upload());
+  assert.equal(none.ok && "idempotencyKey" in none.upload, false);
+});
