@@ -121,12 +121,13 @@ key".
 | `POST /api/requests` | Multipart, the same fields as the admin form: `title`, `clientName`, `clientEmail`, `order` (`client_first` or `me_first`) and `pdf`. Creates the request and emails the first signer. Returns `201` with the id, contract page URL, fingerprint and whether the invite went out. |
 | `POST /api/requests` with `dryRun=1` | Validates the upload and returns what would be sent (signers, page count, fingerprint). Stores and sends nothing. |
 | `GET /api/requests` | The contract list: `q` (search), `view` (`all`, `waiting_client`, `waiting_me`, `completed`, `voided`), `limit` (up to 100), `offset`. |
-| `GET /api/requests/<id>` | One contract: signers, audit trail, executed-PDF deliveries, and who it's waiting on. |
+| `GET /api/requests/<id>` | One contract: signers, audit trail, who it's waiting on (none once voided or completed), and each executed-PDF delivery with its `state` (`pending`, `retrying`, `failed`, `delivered`), attempts and last error. |
 
 Both the API and the admin form go through the same validation (`src/server/intake.ts`) and the
 same create-and-send function, so API requests get identical checks and audit events. The
 request's metadata records `createdVia` (`web` or `api`). Errors come back as JSON:
-`{"error": "..."}`.
+`{"error": "..."}`. If the invite email went out but its audit event couldn't be written, the
+response has `inviteSent: true` and a `warning`: don't send again, which would email a duplicate.
 
 To turn it on, or rotate the key:
 

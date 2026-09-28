@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import nodemailer from "nodemailer";
 import { config, googleEnabled, apiEnabled } from "./config.ts";
 import { beginGoogleLogin, completeGoogleLogin } from "./google.ts";
-import { PgStore, type RequestView } from "./store.ts";
+import { PgStore, MAX_DELIVERY_ATTEMPTS, type RequestView } from "./store.ts";
 import { validateContractUpload, formField, type ContractUpload } from "./intake.ts";
 import { buildSignedPdf } from "./pdf.ts";
 import * as pages from "./pages.ts";
@@ -62,13 +62,21 @@ function signingUrl(request: SignatureRequest, signer: Signer, token: string) {
   return `${config.baseUrl}/sign/${request.id}/${signer.id}?token=${encodeURIComponent(token)}`;
 }
 
+/** The invite email went out, but recording the "sent" audit event failed afterwards.
+ * Callers must not treat this as an unsent invite: re-sending would email a duplicate. */
+class AuditWriteError extends Error {}
+
 async function sendInvite(request: SignatureRequest, signer: Signer, token: string, isCountersigner: boolean, req?: IncomingMessage) {
   const message = inviteEmail({ baseUrl: config.baseUrl, signerName: signer.name, requestTitle: request.title, signingUrl: signingUrl(request, signer, token), isCountersigner, expiresInDays: config.linkExpiresInDays });
   await sendEmail({ to: { email: signer.email, name: signer.name }, ...message });
-  await store.appendAuditEvent({
-    id: newId(), requestId: request.id, signerId: signer.id, type: "sent", occurredAt: new Date().toISOString(),
-    ip: req ? clientIp(req) : undefined, userAgent: req ? userAgent(req) : undefined, detail: { to: signer.email, isCountersigner },
-  });
+  try {
+    await store.appendAuditEvent({
+      id: newId(), requestId: request.id, signerId: signer.id, type: "sent", occurredAt: new Date().toISOString(),
+      ip: req ? clientIp(req) : undefined, userAgent: req ? userAgent(req) : undefined, detail: { to: signer.email, isCountersigner },
+    });
+  } catch (error) {
+    throw new AuditWriteError(`invite emailed to ${signer.email}, but the audit event could not be recorded: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /** Build and store the executed PDF if it doesn't exist yet. Safe to call again: an
@@ -259,6 +267,7 @@ route("POST", /^\/logout$/, async (_req, res) => {
  * Create a signature request from a validated upload and email the first signer.
  * Shared by the admin form and the API. The request exists even if the invite email
  * fails; `inviteError` says so, and "Resend link" on the contract page recovers it.
+ * `auditWarning` means the email did go out but its audit event wasn't recorded.
  */
 async function createAndSend(upload: ContractUpload, via: "web" | "api", req: IncomingMessage) {
   const client = { name: upload.clientName, email: upload.clientEmail };
@@ -278,13 +287,19 @@ async function createAndSend(upload: ContractUpload, via: "web" | "api", req: In
 
   const first = request.signers.find((s) => s.order === 0)!;
   let inviteError: string | undefined;
+  let auditWarning: string | undefined;
   try {
     await sendInvite(request, first, rawTokens.get(first.id)!, false, req);
   } catch (error) {
-    console.error("[email] invite failed", error);
-    inviteError = error instanceof Error ? error.message : String(error);
+    if (error instanceof AuditWriteError) {
+      console.error("[audit]", error.message);
+      auditWarning = error.message;
+    } else {
+      console.error("[email] invite failed", error);
+      inviteError = error instanceof Error ? error.message : String(error);
+    }
   }
-  return { request, first, inviteError };
+  return { request, first, inviteError, auditWarning };
 }
 
 route("POST", /^\/requests$/, async (req, res) => {
@@ -295,9 +310,13 @@ route("POST", /^\/requests$/, async (req, res) => {
     redirect(res, `/?error=${encodeURIComponent(intake.error)}`);
     return;
   }
-  const { request, first, inviteError } = await createAndSend(intake.upload, "web", req);
+  const { request, first, inviteError, auditWarning } = await createAndSend(intake.upload, "web", req);
   if (inviteError) {
     redirect(res, `/requests/${request.id}?error=${encodeURIComponent("Request created but the invite email failed to send. Use Resend link.")}`);
+    return;
+  }
+  if (auditWarning) {
+    redirect(res, `/requests/${request.id}?error=${encodeURIComponent(`Sent to ${first.email}, but the "sent" audit event could not be recorded. Don't resend.`)}`);
     return;
   }
   redirect(res, `/requests/${request.id}?notice=${encodeURIComponent(`Sent to ${first.name} (${first.email}).`)}`);
@@ -496,6 +515,16 @@ function requireApi(req: IncomingMessage): void {
   if (!bearerTokenMatches(req, config.apiToken)) throw new HttpError(401, "missing or wrong API key");
 }
 
+/** A whole number within bounds, or a 400. Postgres rejects fractional or huge LIMIT/OFFSET. */
+function intParam(url: URL, name: string, fallback: number, min: number, max: number): number {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw === "") return fallback;
+  if (!/^\d+$/.test(raw) || Number(raw) < min || Number(raw) > max) {
+    throw new HttpError(400, `${name} must be a whole number from ${min} to ${max}`);
+  }
+  return Number(raw);
+}
+
 const adminUrl = (id: string) => `${config.baseUrl}/requests/${id}`;
 
 function signerJson(s: { name: string; email: string; order: number; status: string; signedAt?: string }) {
@@ -521,18 +550,18 @@ route("POST", /^\/api\/requests$/, async (req, res) => {
     json(res, 200, { dryRun: true, ...summary });
     return;
   }
-  const { request, first, inviteError } = await createAndSend(u, "api", req);
+  const { request, first, inviteError, auditWarning } = await createAndSend(u, "api", req);
   console.log(`[api] created request ${request.id} "${u.title}", invite to ${first.email}${inviteError ? " FAILED" : ""}`);
   json(res, 201, {
     id: request.id, status: request.status, adminUrl: adminUrl(request.id), ...summary,
-    inviteSent: !inviteError, inviteError: inviteError ?? null,
+    inviteSent: !inviteError, inviteError: inviteError ?? null, warning: auditWarning ?? null,
   });
 });
 
 route("GET", /^\/api\/requests$/, async (req, res, _p, url) => {
   requireApi(req);
-  const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 25));
-  const offset = Math.max(0, Number(url.searchParams.get("offset")) || 0);
+  const limit = intParam(url, "limit", 25, 1, 100);
+  const offset = intParam(url, "offset", 0, 0, 1_000_000);
   const list = await store.listRequests({
     q: (url.searchParams.get("q") ?? "").slice(0, 200), view: (url.searchParams.get("view") ?? "all") as RequestView,
     adminEmail: config.adminSigner.email, limit, offset,
@@ -553,10 +582,16 @@ route("GET", new RegExp(`^/api/requests/${UUID}$`), async (req, res, [id]) => {
   json(res, 200, {
     id: request.id, title: request.title, status: request.status, createdAt: request.createdAt, adminUrl: adminUrl(request.id),
     filename: doc.filename, pdfSha256: doc.pdfSha256, signedSha256: doc.signedSha256 ?? null, completedAt: doc.completedAt ?? null,
-    nextSigner: (() => { const n = nextSignerToInvite(request); return n ? { name: n.name, email: n.email } : null; })(),
+    // A voided request still has pending signers, but nobody can sign it any more.
+    nextSigner: (() => { const n = request.status === "pending" ? nextSignerToInvite(request) : undefined; return n ? { name: n.name, email: n.email } : null; })(),
     signers: request.signers.map(signerJson),
     events: events.map((e) => ({ type: e.type, signer: emailOf.get(e.signerId) ?? null, occurredAt: e.occurredAt })),
-    deliveries: deliveries.map((d) => ({ signer: emailOf.get(d.signerId) ?? null, deliveredAt: d.deliveredAt ?? null })),
+    deliveries: deliveries.map((d) => ({
+      signer: emailOf.get(d.signerId) ?? null, deliveredAt: d.deliveredAt ?? null,
+      attempts: d.attempts, lastAttemptAt: d.lastAttemptAt ?? null, lastError: d.lastError ?? null,
+      // Same rule as the contract page: past the retry limit only "Resend executed PDF" helps.
+      state: d.deliveredAt ? "delivered" : d.attempts === 0 ? "pending" : d.attempts < MAX_DELIVERY_ATTEMPTS ? "retrying" : "failed",
+    })),
   });
 });
 
