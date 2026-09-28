@@ -152,7 +152,9 @@ export class PgStore implements SignatureStore {
     await this.pool.query(SCHEMA_SQL);
   }
 
-  async createRequest(request: SignatureRequest): Promise<void> {
+  /** With `document`, the uploaded PDF is stored in the same transaction, so a crash can
+   * never leave a pending request (which may hold an API idempotency key) without it. */
+  async createRequest(request: SignatureRequest, document?: { filename: string; pdf: Buffer; pdfSha256: string }): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
@@ -166,6 +168,12 @@ export class PgStore implements SignatureStore {
           `insert into signature_signers (id, request_id, name, email, "order", status, signed_at, token_hash, token_expires_at)
            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [s.id, request.id, s.name, s.email, s.order, s.status, s.signedAt ?? null, s.tokenHash, s.tokenExpiresAt],
+        );
+      }
+      if (document) {
+        await client.query(
+          "insert into contract_documents (request_id, filename, pdf, pdf_sha256) values ($1, $2, $3, $4)",
+          [request.id, document.filename, document.pdf, document.pdfSha256],
         );
       }
       await client.query("commit");
@@ -299,13 +307,6 @@ export class PgStore implements SignatureStore {
       counts,
       view,
     };
-  }
-
-  async saveDocument(doc: { requestId: string; filename: string; pdf: Buffer; pdfSha256: string }): Promise<void> {
-    await this.pool.query(
-      "insert into contract_documents (request_id, filename, pdf, pdf_sha256) values ($1, $2, $3, $4)",
-      [doc.requestId, doc.filename, doc.pdf, doc.pdfSha256],
-    );
   }
 
   /** Everything about a contract's files except the files themselves. PDFs can be up to

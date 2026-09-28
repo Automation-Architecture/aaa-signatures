@@ -20,7 +20,7 @@ import { inviteEmail, completedEmail } from "./emails.ts";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { createRequire } from "node:module";
-import type { SignatureRequest, Signer } from "../types.ts";
+import type { SignatureRequest, SignatureStore, Signer } from "../types.ts";
 
 const store = new PgStore(config.databaseUrl);
 const secure = config.baseUrl.startsWith("https://");
@@ -281,14 +281,23 @@ async function createAndSend(upload: ContractUpload, via: "web" | "api", req: In
   const documentHtml = `<p>Contract: ${pages.esc(upload.title)}</p><p>File: ${pages.esc(upload.filename)}</p><p>PDF SHA-256: ${upload.pdfSha256}</p>` +
     `<p>Parties: ${signers.map((s) => `${pages.esc(s.name)} &lt;${pages.esc(s.email)}&gt;`).join("; ")}</p>`;
 
-  const { request, rawTokens } = await createSignatureRequest(store, {
+  // The request, its signers and the PDF commit in one transaction: a request that exists
+  // without its document would hold its idempotency key and fail every retry.
+  const document = { filename: upload.filename, pdf: upload.pdf, pdfSha256: upload.pdfSha256 };
+  const storeWithDocument: SignatureStore = {
+    createRequest: (r) => store.createRequest(r, document),
+    getRequest: (id) => store.getRequest(id),
+    updateSigner: (requestId, signerId, patch) => store.updateSigner(requestId, signerId, patch),
+    updateRequestStatus: (requestId, status) => store.updateRequestStatus(requestId, status),
+    appendAuditEvent: (event) => store.appendAuditEvent(event),
+  };
+  const { request, rawTokens } = await createSignatureRequest(storeWithDocument, {
     title: upload.title, documentHtml, signers, expiresInDays: config.linkExpiresInDays,
     metadata: {
       filename: upload.filename, pdfSha256: upload.pdfSha256, order: upload.order, createdVia: via,
       ...(upload.idempotencyKey ? { idempotencyKey: upload.idempotencyKey } : {}),
     },
   });
-  await store.saveDocument({ requestId: request.id, filename: upload.filename, pdf: upload.pdf, pdfSha256: upload.pdfSha256 });
 
   const first = request.signers.find((s) => s.order === 0)!;
   let inviteError: string | undefined;
