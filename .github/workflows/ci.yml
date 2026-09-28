@@ -1,0 +1,41 @@
+name: CI
+
+# Until this workflow, `npm test` only ever ran on someone's laptop, so nothing
+# stopped a change that breaks the build or the tests from reaching main. And
+# main is what gets deployed: deploys are manual `railway up` from a checkout of
+# main (see README, Deploy). This job is meant to be a required check.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 22 matches production: Railway runs 22.x, and package.json requires
+      # >=22.13 because the tests use --experimental-strip-types.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # npm ci installs exactly package-lock.json and runs the prepare script,
+      # which already builds once.
+      - name: Install
+        run: npm ci
+
+      # tsc is the type check: the build fails on any type error in the library
+      # or the contract app.
+      - name: Build and type-check
+        run: npm run build
+
+      - name: Test
+        run: npm test
