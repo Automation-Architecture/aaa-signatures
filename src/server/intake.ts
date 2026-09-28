@@ -83,3 +83,36 @@ export async function validateContractUpload(parts: FormPart[]): Promise<IntakeR
     },
   };
 }
+
+export interface Party { name: string; email: string }
+
+/** A stored contract, as far as an idempotent retry needs to compare it. */
+export interface PersistedContract {
+  title: string;
+  filename: string;
+  pdfSha256: string;
+  order: unknown;
+  signers: { name: string; email: string; order: number }[];
+}
+
+/** The signers a send creates, in signing order. */
+export function plannedSigners(upload: Pick<ContractUpload, "clientName" | "clientEmail" | "order">, countersigner: Party): Party[] {
+  const client = { name: upload.clientName, email: upload.clientEmail };
+  return upload.order === "me_first" ? [countersigner, client] : [client, countersigner];
+}
+
+/** The contract-defining fields on which a retried upload differs from the contract its
+ * idempotency key already created. Empty means it is the same send. */
+export function idempotencyMismatches(upload: ContractUpload, countersigner: Party, stored: PersistedContract): string[] {
+  const out: string[] = [];
+  if (stored.title !== upload.title) out.push("title");
+  if (stored.filename !== upload.filename) out.push("filename");
+  if (stored.pdfSha256 !== upload.pdfSha256) out.push("pdf");
+  if (stored.order !== upload.order) out.push("order");
+  const want = plannedSigners(upload, countersigner);
+  const have = [...stored.signers].sort((a, b) => a.order - b.order);
+  const sameSigners = have.length === want.length && have.every((s, i) =>
+    s.name === want[i]!.name && s.email.toLowerCase() === want[i]!.email.toLowerCase());
+  if (!sameSigners) out.push("signers");
+  return out;
+}

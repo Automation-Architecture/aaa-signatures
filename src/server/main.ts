@@ -6,7 +6,7 @@ import nodemailer from "nodemailer";
 import { config, googleEnabled, apiEnabled } from "./config.ts";
 import { beginGoogleLogin, completeGoogleLogin } from "./google.ts";
 import { PgStore, MAX_DELIVERY_ATTEMPTS, type RequestView } from "./store.ts";
-import { validateContractUpload, formField, type ContractUpload } from "./intake.ts";
+import { validateContractUpload, formField, idempotencyMismatches, type ContractUpload } from "./intake.ts";
 import { buildSignedPdf } from "./pdf.ts";
 import * as pages from "./pages.ts";
 import {
@@ -562,15 +562,32 @@ route("POST", /^\/api\/requests$/, async (req, res) => {
     client, countersigner: config.adminSigner, firstSigner,
   };
   // A retry of a send that already went through (same key, still pending) returns that
-  // contract instead of creating and emailing a second one.
+  // contract instead of creating and emailing a second one. Every contract-defining field
+  // must match, and the response describes what is stored, not what this call asked for.
   const existingResponse = async (id: string) => {
     const [existing, doc] = await Promise.all([store.getRequest(id), store.getDocumentMeta(id)]);
     if (!existing || !doc) throw new HttpError(500, "idempotency key points at a missing request");
-    if (doc.pdfSha256 !== u.pdfSha256) throw new HttpError(409, "this idempotencyKey was already used for a different PDF");
-    return { id, status: existing.status, adminUrl: adminUrl(id), ...summary, duplicate: true, inviteSent: null, inviteError: null, warning: null };
+    const order = existing.metadata?.order;
+    const mismatched = idempotencyMismatches(u, config.adminSigner, {
+      title: existing.title, filename: doc.filename, pdfSha256: doc.pdfSha256, order, signers: existing.signers,
+    });
+    if (mismatched.length) {
+      throw new HttpError(409, `this idempotencyKey was already used for a different contract (differs in: ${mismatched.join(", ")})`);
+    }
+    const signers = [...existing.signers].sort((a, b) => a.order - b.order).map((s) => ({ name: s.name, email: s.email }));
+    const storedCountersigner = order === "me_first" ? signers[0]! : signers[1]!;
+    const storedClient = order === "me_first" ? signers[1]! : signers[0]!;
+    return {
+      id, status: existing.status, adminUrl: adminUrl(id),
+      title: existing.title, filename: doc.filename, pdfSha256: doc.pdfSha256, pageCount: u.pageCount, order,
+      client: storedClient, countersigner: storedCountersigner, firstSigner: signers[0]!,
+      duplicate: true, inviteSent: null, inviteError: null, warning: null,
+    };
   };
   const existingId = u.idempotencyKey ? await store.findPendingByIdempotencyKey(u.idempotencyKey) : null;
   if (formField(parts, "dryRun") === "1") {
+    // Same check as the real send, so a preview never promises a duplicate the send would refuse.
+    if (existingId) await existingResponse(existingId);
     json(res, 200, { dryRun: true, ...summary, alreadySent: existingId ? { id: existingId, adminUrl: adminUrl(existingId) } : null });
     return;
   }

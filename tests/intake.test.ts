@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PDFDocument } from "pdf-lib";
-import { validateContractUpload } from "../src/server/intake.ts";
+import { validateContractUpload, idempotencyMismatches } from "../src/server/intake.ts";
 import { bearerTokenMatches, type FormPart } from "../src/server/http.ts";
 
 async function onePagePdf(): Promise<Buffer> {
@@ -73,4 +73,24 @@ test("an idempotency key is optional and must be a plain token", async () => {
   assert.equal((await validateContractUpload(await upload({ idempotencyKey: "has spaces in it, sixteen+" }))).ok, false);
   const none = await validateContractUpload(await upload());
   assert.equal(none.ok && "idempotencyKey" in none.upload, false);
+});
+
+test("an idempotency key only matches a stored contract with the same defining fields", async () => {
+  const result = await validateContractUpload(await upload({ idempotencyKey: "k".repeat(32) }));
+  assert.ok(result.ok);
+  if (!result.ok) return;
+  const u = result.upload;
+  const me = { name: "Brad", email: "brad@example.com" };
+  const stored = {
+    title: u.title, filename: u.filename, pdfSha256: u.pdfSha256, order: "client_first",
+    signers: [{ name: "Brad", email: "brad@example.com", order: 1 }, { name: "Ada Client", email: "ADA@example.com", order: 0 }],
+  };
+  assert.deepEqual(idempotencyMismatches(u, me, stored), []);
+  assert.deepEqual(idempotencyMismatches(u, me, { ...stored, title: "Other" }), ["title"]);
+  assert.deepEqual(idempotencyMismatches(u, me, { ...stored, filename: "x.pdf" }), ["filename"]);
+  assert.deepEqual(idempotencyMismatches(u, me, { ...stored, pdfSha256: "0".repeat(64) }), ["pdf"]);
+  assert.deepEqual(idempotencyMismatches(u, me, { ...stored, order: "me_first" }), ["order"]);
+  assert.deepEqual(idempotencyMismatches(u, me, {
+    ...stored, signers: [{ name: "Bob Other", email: "bob@example.com", order: 0 }, { name: "Brad", email: "brad@example.com", order: 1 }],
+  }), ["signers"]);
 });
