@@ -116,3 +116,18 @@ export function idempotencyMismatches(upload: ContractUpload, countersigner: Par
   if (!sameSigners) out.push("signers");
   return out;
 }
+
+/** What an idempotent retry can honestly say about the original invite. A recorded "sent"
+ * event proves it went out. No event does not prove it failed: the email can be accepted
+ * before its audit write fails, and a racing retry can look before the first send finishes.
+ * So that case is unknown (null), with a warning to check before resending. */
+export function duplicateInviteState(events: { type: string; signerId: string }[], first: { id: string; email: string }) {
+  if (events.some((e) => e.type === "sent" && e.signerId === first.id)) {
+    return { inviteSent: true as const, inviteError: null, warning: null };
+  }
+  return {
+    inviteSent: null,
+    inviteError: null,
+    warning: `No invite to ${first.email} is recorded yet. It may still be sending, or it may have gone out without its audit event. Check the contract page before using "Resend link".`,
+  };
+}

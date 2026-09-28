@@ -6,7 +6,7 @@ import nodemailer from "nodemailer";
 import { config, googleEnabled, apiEnabled } from "./config.ts";
 import { beginGoogleLogin, completeGoogleLogin } from "./google.ts";
 import { PgStore, MAX_DELIVERY_ATTEMPTS, type RequestView } from "./store.ts";
-import { validateContractUpload, formField, idempotencyMismatches, type ContractUpload } from "./intake.ts";
+import { validateContractUpload, formField, idempotencyMismatches, duplicateInviteState, type ContractUpload } from "./intake.ts";
 import { buildSignedPdf } from "./pdf.ts";
 import * as pages from "./pages.ts";
 import {
@@ -587,16 +587,14 @@ route("POST", /^\/api\/requests$/, async (req, res) => {
     const storedCountersigner = order === "me_first" ? signers[0]! : signers[1]!;
     const storedClient = order === "me_first" ? signers[1]! : signers[0]!;
     // The original call's response may have been lost, so report the invite outcome from
-    // what was persisted: sendInvite records a "sent" event only after the email went out.
+    // what was persisted: sent (a "sent" event exists) or unknown, never a guessed failure.
     const first = [...existing.signers].sort((a, b) => a.order - b.order)[0]!;
-    const inviteSent = (await store.listAuditEvents(id)).some((e) => e.type === "sent" && e.signerId === first.id);
+    const invite = duplicateInviteState(await store.listAuditEvents(id), first);
     return {
       id, status: existing.status, adminUrl: adminUrl(id),
       title: existing.title, filename: doc.filename, pdfSha256: doc.pdfSha256, pageCount: u.pageCount, order,
       client: storedClient, countersigner: storedCountersigner, firstSigner: signers[0]!,
-      duplicate: true, inviteSent,
-      inviteError: inviteSent ? null : `no invite is recorded as sent to ${first.email}; use "Resend link" on the contract page`,
-      warning: null,
+      duplicate: true, ...invite,
     };
   };
   const existingId = u.idempotencyKey ? await store.findPendingByIdempotencyKey(u.idempotencyKey) : null;

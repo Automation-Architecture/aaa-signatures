@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PDFDocument } from "pdf-lib";
-import { validateContractUpload, idempotencyMismatches } from "../src/server/intake.ts";
+import { validateContractUpload, idempotencyMismatches, duplicateInviteState } from "../src/server/intake.ts";
 import { bearerTokenMatches, type FormPart } from "../src/server/http.ts";
 
 async function onePagePdf(): Promise<Buffer> {
@@ -93,4 +93,15 @@ test("an idempotency key only matches a stored contract with the same defining f
   assert.deepEqual(idempotencyMismatches(u, me, {
     ...stored, signers: [{ name: "Bob Other", email: "bob@example.com", order: 0 }, { name: "Brad", email: "brad@example.com", order: 1 }],
   }), ["signers"]);
+});
+
+test("a retry reports the invite as sent only when a sent event is recorded, otherwise unknown", () => {
+  const first = { id: "s1", email: "ada@example.com" };
+  assert.deepEqual(duplicateInviteState([{ type: "sent", signerId: "s1" }], first), { inviteSent: true, inviteError: null, warning: null });
+  for (const events of [[], [{ type: "sent", signerId: "s2" }], [{ type: "viewed", signerId: "s1" }]]) {
+    const state = duplicateInviteState(events, first);
+    assert.equal(state.inviteSent, null);
+    assert.equal(state.inviteError, null);
+    assert.match(state.warning ?? "", /ada@example\.com/);
+  }
 });
