@@ -186,7 +186,9 @@ type Handler = (req: IncomingMessage, res: ServerResponse, params: string[], url
 const routes: { method: string; pattern: RegExp; handler: Handler }[] = [];
 const route = (method: string, pattern: RegExp, handler: Handler) => routes.push({ method, pattern, handler });
 
-const UUID = "([0-9a-f-]{36})";
+// Ids come from randomUUID() (lowercase). A strict shape keeps malformed ids like 36
+// hyphens away from Postgres's uuid columns, where they would error instead of 404.
+const UUID = "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})";
 
 function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
   const session = readSession(req, config.sessionSecret);
@@ -515,6 +517,16 @@ function requireApi(req: IncomingMessage): void {
   if (!bearerTokenMatches(req, config.apiToken)) throw new HttpError(401, "missing or wrong API key");
 }
 
+const VIEWS: readonly RequestView[] = ["all", "waiting_client", "waiting_me", "completed", "voided"];
+
+/** The list view, or a 400. The store falls back to "all" for an unknown view, which an
+ * API client would mistake for a filtered result. */
+function viewParam(url: URL): RequestView {
+  const raw = url.searchParams.get("view") || "all";
+  if (!(VIEWS as readonly string[]).includes(raw)) throw new HttpError(400, `view must be one of ${VIEWS.join(", ")}`);
+  return raw as RequestView;
+}
+
 /** A whole number within bounds, or a 400. Postgres rejects fractional or huge LIMIT/OFFSET. */
 function intParam(url: URL, name: string, fallback: number, min: number, max: number): number {
   const raw = url.searchParams.get(name);
@@ -563,7 +575,7 @@ route("GET", /^\/api\/requests$/, async (req, res, _p, url) => {
   const limit = intParam(url, "limit", 25, 1, 100);
   const offset = intParam(url, "offset", 0, 0, 1_000_000);
   const list = await store.listRequests({
-    q: (url.searchParams.get("q") ?? "").slice(0, 200), view: (url.searchParams.get("view") ?? "all") as RequestView,
+    q: (url.searchParams.get("q") ?? "").slice(0, 200), view: viewParam(url),
     adminEmail: config.adminSigner.email, limit, offset,
   });
   json(res, 200, {
