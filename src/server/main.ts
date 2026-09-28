@@ -3,15 +3,15 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import nodemailer from "nodemailer";
-import { PDFDocument } from "pdf-lib";
-import { config, googleEnabled } from "./config.ts";
+import { config, googleEnabled, apiEnabled } from "./config.ts";
 import { beginGoogleLogin, completeGoogleLogin } from "./google.ts";
 import { PgStore, type RequestView } from "./store.ts";
+import { validateContractUpload, formField, type ContractUpload } from "./intake.ts";
 import { buildSignedPdf } from "./pdf.ts";
 import * as pages from "./pages.ts";
 import {
   HttpError, clientIp, userAgent, readBody, parseMultipart, parseForm, readSession, setSessionCookie,
-  clearSessionCookie, constantTimeEqual, html, redirect,
+  clearSessionCookie, constantTimeEqual, html, redirect, json, bearerTokenMatches,
 } from "./http.ts";
 import { createSignatureRequest, issueSignerToken, nextSignerToInvite } from "../request.ts";
 import { getSigningView, captureSignature, SigningError } from "../sign.ts";
@@ -255,64 +255,48 @@ route("POST", /^\/logout$/, async (_req, res) => {
   redirect(res, "/");
 });
 
-route("POST", /^\/requests$/, async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  const body = await readBody(req, config.maxUploadBytes);
-  const parts = parseMultipart(body, String(req.headers["content-type"] ?? ""));
-  const field = (name: string) => parts.find((p) => p.name === name && !p.filename)?.data.toString("utf8").trim() ?? "";
-  const file = parts.find((p) => p.name === "pdf" && p.filename);
-
-  const title = field("title");
-  const clientName = field("clientName");
-  const clientEmail = field("clientEmail");
-  const order = field("order");
-  if (!title || !clientName || !clientEmail || !file || file.data.length === 0) {
-    redirect(res, `/?error=${encodeURIComponent("Title, client name, client email and a PDF are all required.")}`);
-    return;
-  }
-  if (!file.data.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
-    redirect(res, `/?error=${encodeURIComponent("That file is not a PDF.")}`);
-    return;
-  }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clientEmail)) {
-    redirect(res, `/?error=${encodeURIComponent("Client email does not look valid.")}`);
-    return;
-  }
-
-  // Do the same work finalization will do (parse, add a page, save) so a PDF that
-  // would break the executed record is refused now, not after both parties sign.
-  try {
-    const probe = await PDFDocument.load(file.data, { ignoreEncryption: true });
-    if (probe.getPageCount() === 0) throw new Error("no pages");
-    probe.addPage();
-    await probe.save();
-  } catch {
-    redirect(res, `/?error=${encodeURIComponent("That PDF could not be read. Re-export it and try again.")}`);
-    return;
-  }
-
-  const pdfSha256 = createHash("sha256").update(file.data).digest("hex");
-  const client = { name: clientName, email: clientEmail };
+/**
+ * Create a signature request from a validated upload and email the first signer.
+ * Shared by the admin form and the API. The request exists even if the invite email
+ * fails; `inviteError` says so, and "Resend link" on the contract page recovers it.
+ */
+async function createAndSend(upload: ContractUpload, via: "web" | "api", req: IncomingMessage) {
+  const client = { name: upload.clientName, email: upload.clientEmail };
   const me = config.adminSigner;
-  const signers = order === "me_first" ? [me, client] : [client, me];
-  const filename = (file.filename ?? "contract.pdf").replace(/[^\w .()-]+/g, "_");
+  const signers = upload.order === "me_first" ? [me, client] : [client, me];
 
   // documentHtml is what the library fingerprints; binding the PDF's own hash and the
   // parties into it means the record fingerprint changes if any of those change.
-  const documentHtml = `<p>Contract: ${pages.esc(title)}</p><p>File: ${pages.esc(filename)}</p><p>PDF SHA-256: ${pdfSha256}</p>` +
+  const documentHtml = `<p>Contract: ${pages.esc(upload.title)}</p><p>File: ${pages.esc(upload.filename)}</p><p>PDF SHA-256: ${upload.pdfSha256}</p>` +
     `<p>Parties: ${signers.map((s) => `${pages.esc(s.name)} &lt;${pages.esc(s.email)}&gt;`).join("; ")}</p>`;
 
   const { request, rawTokens } = await createSignatureRequest(store, {
-    title, documentHtml, signers, expiresInDays: config.linkExpiresInDays,
-    metadata: { filename, pdfSha256, order: order === "me_first" ? "me_first" : "client_first" },
+    title: upload.title, documentHtml, signers, expiresInDays: config.linkExpiresInDays,
+    metadata: { filename: upload.filename, pdfSha256: upload.pdfSha256, order: upload.order, createdVia: via },
   });
-  await store.saveDocument({ requestId: request.id, filename, pdf: file.data, pdfSha256 });
+  await store.saveDocument({ requestId: request.id, filename: upload.filename, pdf: upload.pdf, pdfSha256: upload.pdfSha256 });
 
   const first = request.signers.find((s) => s.order === 0)!;
+  let inviteError: string | undefined;
   try {
     await sendInvite(request, first, rawTokens.get(first.id)!, false, req);
   } catch (error) {
     console.error("[email] invite failed", error);
+    inviteError = error instanceof Error ? error.message : String(error);
+  }
+  return { request, first, inviteError };
+}
+
+route("POST", /^\/requests$/, async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const body = await readBody(req, config.maxUploadBytes);
+  const intake = await validateContractUpload(parseMultipart(body, String(req.headers["content-type"] ?? "")));
+  if (!intake.ok) {
+    redirect(res, `/?error=${encodeURIComponent(intake.error)}`);
+    return;
+  }
+  const { request, first, inviteError } = await createAndSend(intake.upload, "web", req);
+  if (inviteError) {
     redirect(res, `/requests/${request.id}?error=${encodeURIComponent("Request created but the invite email failed to send. Use Resend link.")}`);
     return;
   }
@@ -502,6 +486,80 @@ route("GET", /^\/brand\/mark\.png$/, async (_req, res) => {
   res.end(brandMark);
 });
 
+// ---- JSON API ----------------------------------------------------------------------
+// For sending and checking contracts from a Claude Code session (the send-contract skill
+// in skill-shelf). Bearer-key only, off unless CONTRACTS_API_TOKEN is set. It creates
+// requests through the same path as the admin form, so every audit rule still applies.
+
+function requireApi(req: IncomingMessage): void {
+  if (!apiEnabled) throw new HttpError(404, "the API is not enabled");
+  if (!bearerTokenMatches(req, config.apiToken)) throw new HttpError(401, "missing or wrong API key");
+}
+
+const adminUrl = (id: string) => `${config.baseUrl}/requests/${id}`;
+
+function signerJson(s: { name: string; email: string; order: number; status: string; signedAt?: string }) {
+  return { name: s.name, email: s.email, order: s.order, status: s.status, signedAt: s.signedAt ?? null };
+}
+
+// Create and send. With dryRun=1 the upload is validated and described, and nothing is
+// stored or sent, so the caller can show exactly what will go out before confirming.
+route("POST", /^\/api\/requests$/, async (req, res) => {
+  requireApi(req);
+  const body = await readBody(req, config.maxUploadBytes);
+  const parts = parseMultipart(body, String(req.headers["content-type"] ?? ""));
+  const intake = await validateContractUpload(parts);
+  if (!intake.ok) throw new HttpError(400, intake.error);
+  const u = intake.upload;
+  const client = { name: u.clientName, email: u.clientEmail };
+  const firstSigner = u.order === "me_first" ? config.adminSigner : client;
+  const summary = {
+    title: u.title, filename: u.filename, pdfSha256: u.pdfSha256, pageCount: u.pageCount, order: u.order,
+    client, countersigner: config.adminSigner, firstSigner,
+  };
+  if (formField(parts, "dryRun") === "1") {
+    json(res, 200, { dryRun: true, ...summary });
+    return;
+  }
+  const { request, first, inviteError } = await createAndSend(u, "api", req);
+  console.log(`[api] created request ${request.id} "${u.title}", invite to ${first.email}${inviteError ? " FAILED" : ""}`);
+  json(res, 201, {
+    id: request.id, status: request.status, adminUrl: adminUrl(request.id), ...summary,
+    inviteSent: !inviteError, inviteError: inviteError ?? null,
+  });
+});
+
+route("GET", /^\/api\/requests$/, async (req, res, _p, url) => {
+  requireApi(req);
+  const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 25));
+  const offset = Math.max(0, Number(url.searchParams.get("offset")) || 0);
+  const list = await store.listRequests({
+    q: (url.searchParams.get("q") ?? "").slice(0, 200), view: (url.searchParams.get("view") ?? "all") as RequestView,
+    adminEmail: config.adminSigner.email, limit, offset,
+  });
+  json(res, 200, {
+    view: list.view, total: list.total, counts: list.counts,
+    requests: list.rows.map((r) => ({ id: r.id, title: r.title, status: r.status, createdAt: r.createdAt, adminUrl: adminUrl(r.id), signers: r.signers.map(signerJson) })),
+  });
+});
+
+route("GET", new RegExp(`^/api/requests/${UUID}$`), async (req, res, [id]) => {
+  requireApi(req);
+  const request = await store.getRequest(id!);
+  const doc = await store.getDocumentMeta(id!);
+  if (!request || !doc) throw new HttpError(404, "no such request");
+  const [events, deliveries] = await Promise.all([store.listAuditEvents(id!), store.listDeliveries(id!)]);
+  const emailOf = new Map(request.signers.map((s) => [s.id, s.email]));
+  json(res, 200, {
+    id: request.id, title: request.title, status: request.status, createdAt: request.createdAt, adminUrl: adminUrl(request.id),
+    filename: doc.filename, pdfSha256: doc.pdfSha256, signedSha256: doc.signedSha256 ?? null, completedAt: doc.completedAt ?? null,
+    nextSigner: (() => { const n = nextSignerToInvite(request); return n ? { name: n.name, email: n.email } : null; })(),
+    signers: request.signers.map(signerJson),
+    events: events.map((e) => ({ type: e.type, signer: emailOf.get(e.signerId) ?? null, occurredAt: e.occurredAt })),
+    deliveries: deliveries.map((d) => ({ signer: emailOf.get(d.signerId) ?? null, deliveredAt: d.deliveredAt ?? null })),
+  });
+});
+
 route("GET", /^\/healthz$/, async (_req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok"); });
 
 const server = createServer(async (req, res) => {
@@ -521,10 +579,17 @@ const server = createServer(async (req, res) => {
       await r.handler(req, res, match.slice(1), url);
       return;
     }
+    if (url.pathname.startsWith("/api/")) { json(res, 404, { error: "not found" }); return; }
     html(res, 404, pages.messagePage("Not found", "There is nothing at this address."));
   } catch (error) {
-    if (error instanceof HttpError) { html(res, error.status, pages.messagePage("Error", error.message)); return; }
+    const isApi = url.pathname.startsWith("/api/");
+    if (error instanceof HttpError) {
+      if (isApi) json(res, error.status, { error: error.message });
+      else html(res, error.status, pages.messagePage("Error", error.message));
+      return;
+    }
     console.error(`[${req.method} ${url.pathname}]`, error);
+    if (isApi) { json(res, 500, { error: "server error" }); return; }
     html(res, 500, pages.messagePage("Something went wrong", "The server hit an error. Please try again, or contact Automation Architecture AI."));
   }
 });

@@ -20,6 +20,7 @@ guest releases. See [Where it's used](#where-its-used).
 - [Architecture](#architecture)
 - [Where it's used](#where-its-used)
 - [Sending a contract (AAA)](#sending-a-contract-aaa)
+- [Sending a contract from Claude Code (API)](#sending-a-contract-from-claude-code-api)
 - [Sending a guest release (Integrated Intelligence)](#sending-a-guest-release-integrated-intelligence)
 - [Using the library in another app](#using-the-library-in-another-app)
 - [The contract app: configuration and operations](#the-contract-app-configuration-and-operations)
@@ -102,6 +103,38 @@ The page also has these actions:
 
 Replies to any contract email land in the `billing@` mailbox, because `contract@` is an alias of
 it.
+
+## Sending a contract from Claude Code (API)
+
+The contract app has a small JSON API so a Claude Code session can send and track contracts
+without the browser. The `send-contract` skill in
+[skill-shelf](https://github.com/Automation-Architecture/skill-shelf) (`workflow/send-contract`)
+wraps it: it converts a `.docx` to PDF with Pages, shows what will go out, and sends only after
+you confirm.
+
+The API is off unless `CONTRACTS_API_TOKEN` is set (32 characters or more). Every call needs
+`Authorization: Bearer <key>`. The key is in 1Password, vault `aaa-APIs`, item "aaa-contract API
+key".
+
+| Call | What it does |
+|---|---|
+| `POST /api/requests` | Multipart, the same fields as the admin form: `title`, `clientName`, `clientEmail`, `order` (`client_first` or `me_first`) and `pdf`. Creates the request and emails the first signer. Returns `201` with the id, contract page URL, fingerprint and whether the invite went out. |
+| `POST /api/requests` with `dryRun=1` | Validates the upload and returns what would be sent (signers, page count, fingerprint). Stores and sends nothing. |
+| `GET /api/requests` | The contract list: `q` (search), `view` (`all`, `waiting_client`, `waiting_me`, `completed`, `voided`), `limit` (up to 100), `offset`. |
+| `GET /api/requests/<id>` | One contract: signers, audit trail, executed-PDF deliveries, and who it's waiting on. |
+
+Both the API and the admin form go through the same validation (`src/server/intake.ts`) and the
+same create-and-send function, so API requests get identical checks and audit events. The
+request's metadata records `createdVia` (`web` or `api`). Errors come back as JSON:
+`{"error": "..."}`.
+
+To turn it on, or rotate the key:
+
+1. Generate a key: `openssl rand -hex 32`.
+2. Save it in 1Password (`aaa-APIs` / "aaa-contract API key", field `credential`).
+3. Set `CONTRACTS_API_TOKEN` on the `aaa-contract` Railway service, then deploy (see [Deploy](#deploy)).
+
+To turn it off, remove the variable and redeploy. The API then answers `404`.
 
 ## Sending a guest release (Integrated Intelligence)
 
@@ -209,7 +242,7 @@ it, and the signer never types in who they are.
 | Domain | `contracts.automationarchitecture.ai`: Cloudflare CNAME `contracts` to Railway, plus a `_railway-verify.contracts` TXT record. The original `contract.automationarchitecture.ai` still resolves and forwards every request there (see `REDIRECT_HOSTS`), so links emailed before the move keep working. |
 | Admin sign-in | Google OAuth web client in the same Google Cloud project as invoices, redirect `<BASE_URL>/auth/google/callback` |
 | Email | Google Workspace SMTP, signed in as `billing@automationarchitecture.ai`, sending as `contract@` (an alias) |
-| Secrets | 1Password vault `aaa-APIs`: "Google Cloud OAuth", "aaa-signatures app password", and "aaa-contract admin" (a fallback password) |
+| Secrets | 1Password vault `aaa-APIs`: "Google Cloud OAuth", "aaa-signatures app password", "aaa-contract admin" (a fallback password), and "aaa-contract API key" (the API bearer key) |
 
 ### Environment
 
@@ -225,6 +258,7 @@ it, and the signer never types in who they are.
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` | Outgoing mail. `SMTP_PASSWORD` is a Google app password, not the account password. |
 | `EMAIL_FROM_EMAIL`, `EMAIL_FROM_NAME` | Sender shown on every email. |
 | `ADMIN_SIGNER_NAME`, `ADMIN_SIGNER_EMAIL` | The countersigner on every contract. |
+| `CONTRACTS_API_TOKEN` | Bearer key for the JSON API under `/api/`. The API is off when unset or shorter than 32 characters. |
 | `EMAIL_DEV_LOG` | Local only. `1` logs emails instead of sending them, even when SMTP is configured. |
 
 `.env.example` lists them all.
@@ -316,8 +350,9 @@ runs this library at commit `0b94586`, current as of this check. Its own package
 2. **Deploys are manual.** Nothing stops `main` and production from drifting apart. Connect the
    Railway service to this repo so merges to `main` deploy, or add a deploy step to CI.
 3. **No CI runs the tests.** `npm test` only runs locally. Add a GitHub Actions workflow that
-   runs `npm ci`, `npm run build` and `npm test` on every PR. The contract app itself has no
-   automated tests; its failure handling was verified by hand.
+   runs `npm ci`, `npm run build` and `npm test` on every PR. The contract app's automated tests
+   cover only upload validation and the API key check; its database paths and failure
+   handling were verified by hand (the API end to end against a local Postgres, 2026-09-28).
 4. **Integrated Intelligence doesn't retry completion emails.** If Brevo fails when the last
    party signs, the signature is recorded, the request errors and nobody is told. The contract
    app solved this with tracked, retried deliveries. That logic lives in `src/server/`, not the
@@ -351,6 +386,9 @@ The library tests cover:
 - **Token rotation.** A countersign token minted after the first signer finishes works.
 - **Concurrency.** Two simultaneous submissions record one signature.
 - **Happy path.** The full two-signer flow completes and renders the signed record.
+
+The contract app tests (`tests/intake.test.ts`) cover upload validation, shared by the admin
+form and the API, and the API key check.
 
 Integrated Intelligence runs its own `pnpm test` against its real store. It covers concurrent
 submits and countersign-token rotation.

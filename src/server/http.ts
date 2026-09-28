@@ -142,3 +142,22 @@ export function redirect(res: ServerResponse, location: string): void {
   res.writeHead(303, { Location: location, "Cache-Control": "no-store" });
   res.end();
 }
+
+export function json(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+  });
+  res.end(JSON.stringify(body));
+}
+
+/** True when the request carries `Authorization: Bearer <expected>`. An empty expected
+ * token never matches, so an unset key can't be satisfied by an empty header. */
+export function bearerTokenMatches(req: Pick<IncomingMessage, "headers">, expected: string): boolean {
+  if (!expected) return false;
+  const header = req.headers.authorization;
+  const match = /^Bearer\s+(.+)$/i.exec(Array.isArray(header) ? header[0] ?? "" : header ?? "");
+  return Boolean(match) && constantTimeEqual(match![1]!.trim(), expected);
+}

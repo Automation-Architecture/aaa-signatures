@@ -50,6 +50,9 @@ export const config = {
    * signing links already emailed under a previous address keep working. */
   redirectHosts: (process.env.REDIRECT_HOSTS ?? "")
     .split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
+  /** Bearer key for the JSON API under /api/ (used by the send-contract skill). The API
+   * is off unless this is set, and a key shorter than 32 characters is refused. */
+  apiToken: (process.env.CONTRACTS_API_TOKEN ?? "").trim(),
   maxUploadBytes: 25 * 1024 * 1024,
   linkExpiresInDays: 14,
 };
@@ -57,4 +60,9 @@ export const config = {
 export const googleEnabled = Boolean(config.google.clientId && config.google.clientSecret);
 if (!googleEnabled && !config.adminPassword) {
   throw new Error("configure Google sign-in (GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET) or set ADMIN_PASSWORD");
+}
+
+export const apiEnabled = config.apiToken.length >= 32;
+if (config.apiToken && !apiEnabled) {
+  console.error("[api] CONTRACTS_API_TOKEN is shorter than 32 characters: the API stays off");
 }
